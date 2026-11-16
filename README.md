@@ -39,6 +39,14 @@ Reinette II plus (Apple ][+ / IIe, 65C02) with an A2VERA card: VERA video, PSG a
   Programs find the slot at run time with `examples/vera/vera.c`: a slot whose firmware looks like a
   disk controller is skipped, and a hit needs the VERA's registers to read back what was written (the
   floating bus never does).
+- VERA card: `A2_VERA_CARD=a2vera` (default) or `rbl` (`a2run --vera-card rbl`) = the VERA Module
+  RBL-A2: in the VERA's slot n, besides the VERA, a 256 KB Apple II Memory Expansion Card ("Slinky",
+  `$C0n0-$C0n3`, `$C0n2` reads OR `$F0`, `$C0n4-$C0nF` plain registers) and a ProDOS slot ROM at
+  `$Cn00-$CnFF`.  After a reset the ROM answers `$Cn00-$Cn1F` too, so ProDOS boots with a RAM disk
+  `/SLINKY` in `Sn,D1` and `PR#n` boots it once it holds ProDOS; `$C0nF` bit 0 = 1 puts the VERA
+  there (`vera_detect()` and libvera's start-up do it when they read `"VERAS"` at `$CnF0`).  The
+  RAM disk is formatted when the card is chosen and survives resets (`a2run --rbl-image F`,
+  `--rbl-dump F`).  Model and ROM: copies of the card firmware's headers in `rbla2/`.
 - Windows: the VERA window is titled `VERA [A2]` (a window manager script can find and place it); the
   emulator closes from the X of either window.
 - `make install` copies binaries, `assets/` and `rom/` to `~/.local/share/a2emu-vera` and puts `a2emu`/`a2run`/`a2fs` in `~/bin` (override with `DATADIR=`/`BINDIR=`); `make uninstall` removes them but keeps the installed `rom/`.
@@ -76,7 +84,7 @@ Reinette II plus (Apple ][+ / IIe, 65C02) with an A2VERA card: VERA video, PSG a
   third and reads it back, then checks it from the host) use the SDK from this tree.
 - The header of `a2run.c` lists the headless options (`--model`, `--aux`, `--hd`, `--frames`, `--keys`,
   `--input`, `--wav`, `--ymlog`, `--ym off`, ...).
-- YM2151 at VERA base + $20 (`--ym off` / `A2_YM=0` removes it).  YM2151 core: ymfm (BSD-3, `extern/ymfm`).
+- YM2151 at VERA base + $20 on the A2VERA (`--ym off` / `A2_YM=0` removes it).  The RBL-A2 has none (its slot ROM answers `$Cn20-$CnFF`): with `--vera-card rbl` it is off.  YM2151 core: ymfm (BSD-3, `extern/ymfm`).
 
 A2VERA code: @fletto666 
 YMFM integration: @sandlbn

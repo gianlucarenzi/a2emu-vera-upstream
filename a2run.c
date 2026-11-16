@@ -22,6 +22,10 @@
  *     --frames N            stop after N VERA frames (exit 124)
  *     --vera-slot N         VERA card in slot N (1-7, default 4; 0 = no VERA card)
  *     --vera-irq on|off     VERA IRQ -> /IRQ (default on = A2VERA with D1)
+ *     --vera-card C         a2vera (default; env A2_VERA_CARD) | rbl = VERA Module RBL-A2: the VERA
+ *                           and a 256 KB Slinky RAM disk with a ProDOS slot ROM in the VERA's slot
+ *                           (the VERA answers $Cn00-$Cn1F once $C0nF bit 0 = 1, cleared by reset)
+ *     --rbl-image F         preload the RBL-A2 RAM disk from F;  --rbl-dump F  save it at exit
  *     --vera-renderer M     exact | fast | auto (default; env A2_VERA_RENDERER): exact builds
  *                           every VERA line from VRAM and registers, fast takes the shortcuts
  *                           (same pixels), auto = exact while it costs at most half a frame
@@ -52,8 +56,8 @@
  *     --psglog FILE         the PSG registers after every frame that changed them
  *     --psgvlog FILE        the same, sampled at each VSYNC before its IRQ runs (the
  *                           state after the previous IRQ's work; a2run_audio.c)
- *     --ym on|off           the A2VERA's YM2151 at VERA base + $20 (E14; default on,
- *                           env A2_YM); its audio is in the --wav mix
+ *     --ym on|off           the A2VERA's YM2151 at VERA base + $20 (E14; default on, env A2_YM;
+ *                           off with --vera-card rbl, which has none); its audio is in the --wav mix
  *     --ymlog FILE          every YM2151 data write: "<frame> <reg> <val>" (hex)
  *     --pctrace N           print the last N program counters (one per ~32-cycle step) at exit
  *     --stop-pc ADDR        stop as soon as a step ends at ADDR (exit 125; with --pctrace)
@@ -221,7 +225,7 @@ int main(int argc, char **argv) {
 	  else snprintf(romdir, sizeof romdir, "rom"); }
 	const char *hd = NULL, *sdcard = NULL; int writeback = 1;
 	const char *disk1 = NULL, *disk2 = NULL, *xmem_img = NULL, *xmem_dump = NULL;
-	const char *vera_renderer = NULL;
+	const char *vera_card = NULL, *rbl_img = NULL, *rbl_dump = NULL, *vera_renderer = NULL;
 	const char *shot_exit = NULL, *keys = NULL, *loads[32]; int nloads = 0;
 	long pc = -1; unsigned long long max_cycles = 0; long max_frames = 0;
 	int vera_slot = 0, vslot_given = 0, vera_irq = -1, phantom = 1, xmem_kb = 0, xmem_slot = 5, dbg_slot = 3;
@@ -248,7 +252,10 @@ int main(int argc, char **argv) {
 		else if (!strcmp(a, "--frames"))      max_frames = atol(ARG);
 		else if (!strcmp(a, "--vera-slot"))   { vera_slot = atoi(ARG); vslot_given = 1; }
 		else if (!strcmp(a, "--vera-irq"))    vera_irq = strcmp(ARG, "off") != 0;
+		else if (!strcmp(a, "--vera-card"))   vera_card = ARG;
 		else if (!strcmp(a, "--vera-renderer")) vera_renderer = ARG;
+		else if (!strcmp(a, "--rbl-image"))   rbl_img = ARG;
+		else if (!strcmp(a, "--rbl-dump"))    rbl_dump = ARG;
 		else if (!strcmp(a, "--phantom"))     { const char *m = ARG; phantom = !strcmp(m, "off") ? 0 : !strcmp(m, "65c02") ? 3 : 1; phantom_given = 1; }
 		else if (!strcmp(a, "--aux"))         aux = ARG;
 		else if (!strcmp(a, "--ram2e-nvm"))   ram2e_nvm = ARG;
@@ -306,7 +313,16 @@ int main(int argc, char **argv) {
 		if (m < 0) { fprintf(stderr, "a2run: --vera-renderer exact|fast|auto\n"); return 2; }
 		vc_set_renderer(m);
 	}
-	if (vera_slot >= 1 && vera_slot <= 7) g_vera_base = 0xC000 + vera_slot * 0x100;
+	if (vera_card && !vera_card_set(vera_card)) { fprintf(stderr, "a2run: --vera-card a2vera|rbl\n"); return 2; }
+	if (vera_card && ym_opt < 0 && !getenv("A2_YM")) ym_init(g_vera_card != VERA_CARD_RBL);   /* the RBL-A2 has no YM2151 */
+	if ((rbl_img || rbl_dump) && g_vera_card != VERA_CARD_RBL) { fprintf(stderr, "a2run: --rbl-image/--rbl-dump need --vera-card rbl\n"); return 2; }
+	if (rbl_img) {
+		FILE *f = fopen(rbl_img, "rb");
+		if (!f) { fprintf(stderr, "a2run: cannot open %s\n", rbl_img); return 2; }
+		memset(g_rbl_mem, 0, RBL_MEM_SIZE);
+		size_t n = fread(g_rbl_mem, 1, RBL_MEM_SIZE, f); fclose(f); (void)n;
+	}
+	if (vera_slot >= 1 && vera_slot <= 7) { g_vera_base = 0xC000 + vera_slot * 0x100; vera_slot_check(); }
 	if (vera_slot == 0 && vslot_given) g_vera_enabled = 0;
 	if (vera_irq >= 0) g_vera_irq = vera_irq;
 	if (sdcard && !sdcard_attach(sdcard)) { fprintf(stderr, "a2run: cannot use SD card image %s\n", sdcard); return 2; }
@@ -387,6 +403,11 @@ int main(int argc, char **argv) {
 	if (ramdump_path) {
 		FILE *f = fopen(ramdump_path, "wb");
 		if (!f || fwrite(ram, 1, 0xC000, f) != 0xC000) fprintf(stderr, "a2run: RAM dump failed\n");
+		if (f) fclose(f);
+	}
+	if (rbl_dump) {
+		FILE *f = fopen(rbl_dump, "wb");
+		if (!f || fwrite(g_rbl_mem, 1, RBL_MEM_SIZE, f) != RBL_MEM_SIZE) fprintf(stderr, "a2run: RBL-A2 dump failed\n");
 		if (f) fclose(f);
 	}
 	if (xmem_dump && g_xmem_slot) {
