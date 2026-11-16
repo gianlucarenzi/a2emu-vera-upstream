@@ -39,6 +39,8 @@ Reinette II plus (Apple ][+ / IIe, 65C02) with an A2VERA card: VERA video, PSG a
   Programs find the slot at run time with `examples/vera/vera.c`: a slot whose firmware looks like a
   disk controller is skipped, and a hit needs the VERA's registers to read back what was written (the
   floating bus never does).
+- Windows: the VERA window is titled `VERA [A2]` (a window manager script can find and place it); the
+  emulator closes from the X of either window.
 - `make install` copies binaries, `assets/` and `rom/` to `~/.local/share/a2emu-vera` and puts `a2emu`/`a2run`/`a2fs` in `~/bin` (override with `DATADIR=`/`BINDIR=`); `make uninstall` removes them but keeps the installed `rom/`.
 - Keys: Ctrl+F1 / Alt+F1 save the floppy in drive 1 / 2 back to its file, F2 screenshot, F3 paste the clipboard as keystrokes,
   Shift/Ctrl+F4 volume, Shift/Ctrl+F5/F6 joystick release/action speed, Shift/Ctrl+F7 zoom,

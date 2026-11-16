@@ -87,7 +87,7 @@ static void vera_audio_open(void) {
 	SDL_AudioSpec want = { 48828, AUDIO_S16SYS, 2, 0, 1024, 0, 0, NULL, NULL };
 	SDL_AudioSpec have;
 	veraAudio = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
-	if (getenv("A2_FPS"))
+	if (veraAudio && getenv("A2_FPS"))
 		fprintf(stderr, "a2emu: card audio %d Hz %d ch fmt %04X (asked 48828 Hz)\n", have.freq, have.channels, have.format);
 	if (veraAudio) { SDL_PauseAudioDevice(veraAudio, 0); ym_audio_on(); }
 }
@@ -129,13 +129,40 @@ static void vera_audio_out(int16_t *buf, int n) {
 		fwrite(buf, 4, (size_t)n, wav_out);
 		wav_n += (uint32_t)n;
 	}
-	if (!veraAudio) return;
-	/* the main loop's pacing keeps the queue near AUDIO_TARGET (the sound card is the
-	   clock); only a big backlog (after warp / a pause) is dropped */
-	if (!muted && SDL_GetQueuedAudioSize(veraAudio) < 48828u * 4u / 10u)
-		SDL_QueueAudio(veraAudio, buf, (Uint32)n * 4u);
+	if (!veraAudio || muted) return;
+	/* the loop runs on the wall clock (the emulated machine's 59.85 Hz); the sound
+	   card may consume a little faster or slower.  (2026-11-05: "~3 % slower
+	   through PulseAudio" was the loop running ~4 % fast, fixed 2026-11-11.)
+	   The queue is kept near AUDIO_TARGET by dropping or repeating single sample
+	   frames spread evenly over the chunk; a big backlog (after warp / a pause)
+	   is dropped */
+	int q = (int)(SDL_GetQueuedAudioSize(veraAudio) / 4u);
+	if (q >= 48828 / 4) return;
+	/* the queue swings by ~2000 samples with the loop's pacing; reacting to
+	   that (it was up to 1 sample in 16 at once) modulated the pitch by a few
+	   per cent, a vibrato on the music (RastanRIP 2026-11-11).  The correction
+	   follows a slow average of the queue and is at most 1 in 512 (0.2 %):
+	   with the loop counting the cycles really run the drift is ~0 */
+	static int qs = -1;                                       /* average queue, x 64 */
+	if (qs < 0) qs = (int)AUDIO_TARGET * 64;
+	qs += q - qs / 64;
+	int adj = (qs / 64 - (int)AUDIO_TARGET) / 64;             /* > 0: drop, < 0: repeat */
+	int lim = n / 512;
+	if (adj > lim) adj = lim;
+	if (adj < -lim) adj = -lim;
+	if (adj == 0) { SDL_QueueAudio(veraAudio, buf, (Uint32)n * 4u); return; }
+	static int16_t out[2 * (4096 + 4096 / 16 + 1)];
+	int k = adj > 0 ? adj : -adj, m = 0, acc = 0;
+	for (int i = 0; i < n; i++) {
+		acc += k;
+		bool hit = acc >= n;
+		if (hit) acc -= n;
+		if (hit && adj > 0) continue;                         /* drop this frame */
+		out[2 * m] = buf[2 * i]; out[2 * m + 1] = buf[2 * i + 1]; m++;
+		if (hit) { out[2 * m] = buf[2 * i]; out[2 * m + 1] = buf[2 * i + 1]; m++; }   /* repeat it */
+	}
+	SDL_QueueAudio(veraAudio, out, (Uint32)m * 4u);
 }
-
 static void vera_audio_run(void) {
 	static int16_t buf[2 * 4096];
 	int n;
@@ -165,19 +192,23 @@ static void set_env(const char *name, const char *val) {
 
 static const char *on_off(const char *v) { return strcmp(v, "off") ? "1" : "0"; }
 
-/* each option sets the matching A2_* variable */
+/* each option sets the matching A2_* variable (so it overrides the environment);
+   anything else is a disk image */
 static int parse_options(int argc, char *argv[]) {
-	static const struct { const char *opt, *env; int arg; } opts[] = {
-		{ "--model",      "A2_MODEL",     1 },
-		{ "--aux",        "A2_AUX",       1 },
-		{ "--sdcard",     "A2_SDCARD",    1 },
-		{ "--wav",        "A2_WAV",       1 },
-		{ "--ym",         "A2_YM",        2 },
-		{ "--vera-slot",  "A2_VERA_SLOT", 1 },
-		{ "--vera-irq",   "A2_VERA_IRQ",  2 },
-		{ "--snesmax",    "A2_SNESMAX",   1 },
-		{ "--warp",       "A2_WARP",      0 },
-		{ "--fps",        "A2_FPS",       0 },
+	static const struct { const char *opt, *env; int arg; const char *help; } opts[] = {
+		{ "--model",         "A2_MODEL",         1, "ii+ (default) | iie | iiee" },
+		{ "--aux",           "A2_AUX",           1, "IIe aux memory: 0 | 64K | 512K | 1M | 4M | 8M | RAM2E" },
+		{ "--ram2e-nvm",     "A2_RAM2E_NVM",     1, "file for the RAM2E's saved settings" },
+		{ "--sdcard",        "A2_SDCARD",        1, "raw image in the VERA SD slot" },
+		{ "--wav",           "A2_WAV",           1, "record the card's stereo audio" },
+		{ "--ym",            "A2_YM",            2, "the YM2151 at VERA base + $20 (default on)" },
+		{ "--vera-slot",     "A2_VERA_SLOT",     1, "VERA card slot 1-7 (default 4)" },
+		{ "--vera-irq",      "A2_VERA_IRQ",      2, "VERA IRQ -> /IRQ (default on)" },
+		{ "--vera-renderer", "A2_VERA_RENDERER", 1, "exact | fast | auto (default)" },
+		{ "--xmem",          "A2_XMEM",          1, "RAM card: KB[,slot] (slot default 5)" },
+		{ "--snesmax",       "A2_SNESMAX",       1, "SNES MAX card slot" },
+		{ "--warp",          "A2_WARP",          0, "start in warp" },
+		{ "--fps",           "A2_FPS",           0, "print the emulated clock and frame rate" },
 	};
 	int n = 1;
 	for (int i = 1; i < argc; i++) {
@@ -186,16 +217,16 @@ static int parse_options(int argc, char *argv[]) {
 		if (!strcmp(a, "-h") || !strcmp(a, "--help")) {
 			printf("usage: a2emu [options] [disk1] [disk2]\n");
 			for (size_t k = 0; k < sizeof opts / sizeof *opts; k++)
-				printf("  %-12s %-6s same as %s\n", opts[k].opt,
-				       opts[k].arg == 2 ? "on|off" : opts[k].arg ? "ARG" : "", opts[k].env);
-			printf("  %-12s %-6s same as A2_SPEAKER=0\n", "--no-speaker", "");
+				printf("  %-15s %-6s %s (%s)\n", opts[k].opt,
+				       opts[k].arg == 2 ? "on|off" : opts[k].arg ? "ARG" : "", opts[k].help, opts[k].env);
+			printf("  %-15s %-6s no speaker stream (A2_SPEAKER=0)\n", "--no-speaker", "");
 			exit(0);
 		}
 		size_t k;
 		for (k = 0; k < sizeof opts / sizeof *opts; k++)
 			if (!strcmp(a, opts[k].opt)) break;
 		if (k == sizeof opts / sizeof *opts) {
-			if (a[0] == '-' && a[1] == '-') { fprintf(stderr, "a2emu: unknown option %s\n", a); exit(2); }
+			if (a[0] == '-' && a[1] == '-') { fprintf(stderr, "a2emu: unknown option %s (--help lists them)\n", a); exit(2); }
 			argv[n++] = argv[i];
 			continue;
 		}
@@ -222,6 +253,10 @@ int main(int argc, char *argv[]) {
 		printf("failed to initialize SDL2 : %s", SDL_GetError());
 		return -1;
 	}
+
+	/* Hide mouse cursor - positioning and focus handled by window manager */
+	SDL_ShowCursor(SDL_DISABLE);
+	SDL_SetHint(SDL_HINT_MOUSE_FOCUS_CLICKTHROUGH, "1");
 
 	SDL_Window *wdo = SDL_CreateWindow("Reinette ][+", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 280 * zoom, 192 * zoom, SDL_WINDOW_OPENGL);
 	SDL_Renderer *rdr = SDL_CreateRenderer(wdo, -1, SDL_RENDERER_ACCELERATED);   /* paced by the wall clock below, not vsync */
@@ -407,8 +442,32 @@ int main(int argc, char *argv[]) {
 			return 1;
 		}
 		if (!strcmp(model, "iiee")) g_cpu = 2;                                    // 65C02
-		{ const char *ax = getenv("A2_AUX"); g_iie_aux = ax && atoi(ax) >= 64; }  // A2_AUX=64: extended 80-col card
-		SDL_SetWindowTitle(wdo, !strcmp(model, "iiee") ? "Reinette //e (enhanced)" : "Reinette //e");
+		if (!a2_set_aux(getenv("A2_AUX"))) {                                     // --aux / A2_AUX: 64K = 80-col card,
+			SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "Fatal error",          //   512K..8M = RamWorks ($C073),
+				"aux memory (--aux / A2_AUX): use 0, 64K, 512K, 1M, 4M, 8M or RAM2E", NULL);   //   RAM2E = RAM2E II
+			return 1;
+		}
+		if (g_ram2e) {                                                            // its saved settings: A2_RAM2E_NVM,
+			const char *nvm = getenv("A2_RAM2E_NVM");                               //   default ram2e.nvm next to rom/
+			char path[1100];
+			if (!nvm) { snprintf(path, sizeof path, "%.*sram2e.nvm", workDirSize, workDir); nvm = path; }
+			a2_ram2e_nvm(nvm);
+		}
+		SDL_SetWindowTitle(wdo, a2_model_name());
+
+		/* the IIe character generator: lowercase, inverse and (enhanced) MouseText.
+		   Without it TEXT falls back to the ][+ font from assets/ (uppercase only). */
+		uint8_t vrom[0x800];
+		if (a2_load_iie_video_rom(romdir, !strcmp(model, "iiee"), vrom)) {
+			SDL_Surface *s = SDL_CreateRGBSurfaceWithFormat(0, 7 * 256, 8, 32, SDL_PIXELFORMAT_ARGB8888);
+			for (int c = 0; c < 256; c++)
+				for (int y = 0; y < 8; y++)
+					for (int x = 0; x < 7; x++)
+						((uint32_t *)((uint8_t *)s->pixels + y * s->pitch))[c * 7 + x] =
+							(vrom[c * 8 + y] >> x) & 1 ? 0xFF000000 : 0xFFFFFFFF;
+			iieCharTexture = SDL_CreateTextureFromSurface(rdr, s);
+			SDL_FreeSurface(s);
+		}
 	  } }
 
 	if (argc > 1) {                                                               // floppy, or a hard-disk image
@@ -453,7 +512,17 @@ int main(int argc, char *argv[]) {
 			   one 268800-step VERA frame per displayed frame). Programs that pace off
 			   VERA vsync ($C407 / ISR) need this interleave -- one tick/frame would hang
 			   them. Same calibration as the headless harnesses. */
-			for (int vc = 0; vc < 17050; vc += 32) cpu_vera_step();
+			{   /* 17050 CPU cycles a loop, counted on the cycles really run: a step
+			       ends after the instruction that reaches 32 cycles, so it overshoots
+			       by a few; counting 32 a step ran ~4 % fast (the VERA, the game and
+			       the music too: the audio queue kept dropping samples and the
+			       music played ~2/3 semitone sharp, RastanRIP 2026-11-11).  The
+			       overshoot of the last step carries to the next loop */
+				static unsigned int loop_over;
+				unsigned int t0 = ticks, want = 17050u - loop_over;
+				while (ticks - t0 < want) cpu_vera_step();
+				loop_over = (ticks - t0) - want;
+			}
 			while (disk[curDrv].motorOn && ++tries)                                   // until motor is off or i reaches 255+1=0
 				for (int vs = 0; vs < 5000; vs += 32) cpu_vera_step();  // speed up drive access -- tick VERA too (its raster must keep running or the scanline-based VERA detect fails)
 			vera_audio_run();                                                         // E9
@@ -471,6 +540,9 @@ int main(int argc, char *argv[]) {
 			PB2 = shift ? 0xFF : 0x00;                                                // update push button 2
 
 			if (event.type == SDL_QUIT) running = false;                              // WM sent TERM signal
+			if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE)
+				running = false;                                                        // X on either window: with two windows
+			                                                                          // SDL_QUIT never comes (only on the last one)
 
 			// if (event.type == SDL_WINDOWEVENT) {                                      // pause if the window loses focus
 			//   if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
