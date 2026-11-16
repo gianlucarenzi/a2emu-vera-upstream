@@ -39,6 +39,8 @@
 #include "veracore.h"
 #include "a2core.h"
 #include "ym2151.h"
+#include <time.h>
+#include <sys/stat.h>
 
 /* VERA (a2_vera card) mapped in a peripheral slot's I/O window.
    The misterblack1/a2_vera card lives at $Cn00-$Cn1F (slot n); we place it in
@@ -70,8 +72,11 @@ static int              cvs_init  = 0;
    line to the CPU. The line is level-triggered: while ISR & IEN is nonzero and the
    I flag is clear, the CPU keeps taking the IRQ (puce6502IRQ checks P.I). */
 static int cvs_step1 = -1;               /* A2_STEP1=1: one instruction per step (tracing) */
+static int nsc_state;                    /* the No-Slot Clock (below) */
+static void nsc_update(void);
 void cpu_vera_step(void) {
 	if (!cvs_init) { cvs_last = ticks; cvs_init = 1; }
+	if (nsc_state == 1) nsc_update();            /* the No-Slot Clock keeps the time */
 	if (cvs_step1 < 0) cvs_step1 = getenv("A2_STEP1") ? 1 : 0;
 	puce6502Exec(cvs_step1 ? 1 : 32);
 	unsigned int d = ticks - cvs_last; cvs_last = ticks;      /* wrap-safe */
@@ -182,15 +187,32 @@ bool LCWFF = false;                                                             
  * there is no aux RAM: aux reads return $FF, aux writes are lost, ALTZP does nothing
  * (on a real machine it would map in floating bus) -- so aux-detection code (ProDOS's
  * /RAM) correctly finds none.
- * Not modelled: 80-column / double-res VIDEO (the frontend draws 40 columns),
- * snapshots of the IIe state, the IIe keyboard's auto-repeat. */
+ * RamWorks III-style card (g_iie_aux = 2-128 banks of 64 KB, up to 8 MB): a write to
+ * $C071/$C073/$C075/$C077 selects the aux bank (bits 0-6, modulo the banks fitted)
+ * that RAMRD/RAMWRT/80STORE/ALTZP map in; reset selects bank 0.  The 80-column video
+ * always shows bank 0, as on the RamWorks.
+ * RAM2E II (g_ram2e, 8 MB): the same register plus its configuration commands, after
+ * Garrett's Workshop's HDL (RAM2E.v, UFM-MAX.v; see ram2e_write()).  It has no reset
+ * line, so its bank, capacity mask and LED setting survive a reset.
+ * Double-res video: DHIRES is set by any access to $C05E (AN3 off) and cleared by $C05F
+ * or a reset; the frontend draws double hi-res / double lo-res when DHIRES, 80COL and
+ * graphics are on and aux memory is fitted (a2_aux_ram() != NULL), as MAME does.
+ * Not modelled: snapshots of the IIe state, the IIe keyboard's auto-repeat, IOUDIS
+ * and the $C07F RDDHIRES read. */
 int      g_iie = 0;
-int      g_iie_aux = 0;                /* 1 = extended 80-column card (aux 64 KB) fitted */
+int      g_iie_aux = 0;                /* aux 64 KB banks: 0 = none, 1 = extended 80-column
+                                          card, 2-128 = RamWorks-style card ($C073) */
 int      g_memslow = 0;                /* puce6502.c: RAM accesses take the slow path */
 uint8_t  iiecx[0x1000];                /* internal ROM image for $C000-$CFFF */
-static uint8_t aux[RAMSIZE], auxlgc[LGCSIZE], auxbk2[BK2SIZE];
+struct auxbank { uint8_t ram[RAMSIZE], lgc[LGCSIZE], bk2[BK2SIZE]; };
+static struct auxbank auxbank0;        /* banks 1.. are allocated at the first switch to them */
+static struct auxbank *auxbanks;
+static int auxbank_cur = 0;
+static uint8_t *aux = auxbank0.ram, *auxlgc = auxbank0.lgc, *auxbk2 = auxbank0.bk2;
+int      g_ram2e = 0;                  /* 1 = the aux card is a RAM2E II */
 bool S80STORE = false, RAMRD = false, RAMWRT = false, ALTZP = false;
 bool INTCXROM = false, SLOTC3ROM = false, S80COL = false, ALTCHAR = false;
+bool DHIRES = false;                   /* IIe AN3 off: double-res graphics */
 
 /* the bank a RAM access to `a` (< $C000) uses; ZP/stack come via the ALTZP swap */
 static uint8_t noaux_rd[256], noaux_wr[256];   /* no aux card: reads $FF, writes lost */
@@ -204,6 +226,88 @@ static inline uint8_t *iie_bank(uint16_t a, int write) {
 	if (a < 0x0200) return &ram[a];
 	return (write ? RAMWRT : RAMRD) ? aux_at(a, write) : &ram[a];
 }
+const uint8_t *a2_aux_ram(void) { return g_iie_aux ? auxbank0.ram : NULL; }   /* for 80-column video */
+/* aux memory size: "0" (none), "64K" (extended 80-column card), "512K", "1M", "4M",
+ * "8M" (RamWorks-style), "RAM2E" (RAM2E II: 8 MB + its commands).  K/KB/M/MB in either
+ * case; a bare number is in KB, so the old "64" still works.  Returns 0 (and leaves
+ * g_iie_aux alone) on any other value. */
+int a2_set_aux(const char *s) {
+	static const int ok[] = { 0, 64, 512, 1024, 4096, 8192 };
+	if (!s || !*s) s = "0";
+	const char *r = s, *w = "ram2e";
+	while (*r && (*r | 0x20) == *w) r++, w++;
+	if (!*r && !*w) { g_iie_aux = 128; g_ram2e = 1; return 1; }
+	char *e; long n = strtol(s, &e, 10);
+	if (e == s || n < 0) return 0;
+	if (*e == 'M' || *e == 'm' || *e == 'K' || *e == 'k') {
+		if (*e == 'M' || *e == 'm') n *= 1024;
+		if (*++e == 'B' || *e == 'b') e++;
+	}
+	if (*e) return 0;
+	for (unsigned i = 0; i < sizeof ok / sizeof ok[0]; i++)
+		if (n == ok[i]) { g_iie_aux = (int)(n / 64); g_ram2e = 0; return 1; }
+	return 0;
+}
+
+/* RAM2E II command logic (RAM2E.v + UFM-MAX.v, Altera MAX version = chip type $FF).
+ * Every write to the bank register also goes through here:
+ *   - the sequence FF 00 55 AA C1 AD advances CS 0..6, any other byte drops it to 0;
+ *     8 or more CPU cycles with no register write in between also drop it to 0;
+ *   - the byte written at CS 6 is the command, the next write (CS 7) its argument;
+ *   - the bank latched is the byte AND the capacity mask, except right after the
+ *     commands FF (MAX chip detect), F0 (LED present), F1 (rev. C) and E3 (LED get,
+ *     only if the LED is enabled): then it is $FF, which detection software reads back;
+ *   - E0 arg: capacity mask = arg;  E2 arg: LED enable = arg bit 0;
+ *   - EA arg: UFM bitbang, bit 7 = clock in bit 6 (the 16-bit data register, MSB first);
+ *     EE: erase the settings, EF: program the data register.  Erase/program work once
+ *     per power-on, as in the HDL.  The settings word is: mask (8 bits, $80 = $FF), LED
+ *     bit (LED = bit ^ mask bit 7), seven 1s; $FFFF = erased.  It is kept in the file
+ *     a2_ram2e_nvm() names (2 bytes, big endian), if any. */
+static uint8_t  ram2e_mask = 0x7F, ram2e_led = 0, ram2e_cs = 0, ram2e_cmd = 0;
+static int      ram2e_ufm_used = 0;
+static uint16_t ram2e_ufmd = 0xFFFF;
+static unsigned ram2e_last;            /* ticks of the last register write */
+static char     ram2e_nvm_path[1024];
+static void ram2e_load_word(uint16_t w) {  /* the power-on UFM scan: erased = keep defaults */
+	uint8_t m = (uint8_t)(w >> 8), b = (w >> 7) & 1;
+	if (m == 0xFF && b) return;
+	ram2e_mask = m == 0x80 ? 0xFF : m;
+	ram2e_led = b ^ (m >> 7);
+}
+static void ram2e_save_word(uint16_t w) {
+	if (!ram2e_nvm_path[0]) return;
+	FILE *f = fopen(ram2e_nvm_path, "wb");
+	if (!f) { fprintf(stderr, "a2emu: RAM2E settings: can't write %s\n", ram2e_nvm_path); return; }
+	fputc(w >> 8, f); fputc(w & 0xFF, f); fclose(f);
+}
+void a2_ram2e_nvm(const char *path) {          /* power-on: load the saved settings */
+	snprintf(ram2e_nvm_path, sizeof ram2e_nvm_path, "%s", path ? path : "");
+	FILE *f = path ? fopen(path, "rb") : NULL;
+	if (!f) return;
+	int hi = fgetc(f), lo = fgetc(f);
+	fclose(f);
+	if (hi >= 0 && lo >= 0) ram2e_load_word((uint16_t)(hi << 8 | lo));
+}
+static uint8_t ram2e_write(uint8_t v) {       /* returns the bank latched */
+	static const uint8_t seq[6] = { 0xFF, 0x00, 0x55, 0xAA, 0xC1, 0xAD };
+	if (ticks - ram2e_last >= 9) ram2e_cs = 0;  /* >= 8 cycles without a register write */
+	ram2e_last = ticks;
+	uint8_t c = ram2e_cmd, bank;
+	bank = (c == 0xFF || c == 0xF0 || c == 0xF1 || (c == 0xE3 && ram2e_led)) ? 0xFF : v & ram2e_mask;
+	if (c == 0xE0) ram2e_mask = v;
+	else if (c == 0xE2) ram2e_led = v & 1;
+	else if (c == 0xEA && (v & 0x80)) ram2e_ufmd = (uint16_t)(ram2e_ufmd << 1 | ((v >> 6) & 1));
+	ram2e_cmd = 0;
+	if (ram2e_cs == 6) {
+		ram2e_cmd = v;
+		if (!ram2e_ufm_used && (v == 0xEE || v == 0xEF)) {
+			ram2e_ufm_used = 1;
+			ram2e_save_word(v == 0xEF ? ram2e_ufmd : 0xFFFF);
+		}
+	}
+	ram2e_cs = (ram2e_cs >= 6 || v == seq[ram2e_cs]) ? (uint8_t)((ram2e_cs + 1) & 7) : 0;
+	return bank;
+}
 static void iie_update_memslow(void) { g_memslow = g_iie && (RAMRD || RAMWRT || S80STORE); }
 
 static void swapbuf(uint8_t *a, uint8_t *b, size_t n) {
@@ -216,6 +320,20 @@ static void iie_set_altzp(bool on) {            /* swap ZP+stack and the LC with
 	swapbuf(lgc, auxlgc, LGCSIZE);
 	swapbuf(bk2, auxbk2, BK2SIZE);
 	ALTZP = on;
+}
+/* RamWorks bank register: returns 1 if the mapping changed (the caller resyncs fetchMem) */
+static int iie_set_auxbank(uint8_t v) {
+	if (g_iie_aux < 2) return 0;
+	int b = (v & 0x7F) % g_iie_aux;
+	if (b == auxbank_cur) return 0;
+	if (!auxbanks && !(auxbanks = calloc((size_t)g_iie_aux - 1, sizeof *auxbanks))) return 0;
+	bool z = ALTZP;
+	iie_set_altzp(false);                        /* the swap is per bank: undo it, remap, redo */
+	struct auxbank *p = b ? &auxbanks[b - 1] : &auxbank0;
+	aux = p->ram; auxlgc = p->lgc; auxbk2 = p->bk2;
+	auxbank_cur = b;
+	iie_set_altzp(z);
+	return 1;
 }
 
 //============================================================ FETCH-VIEW MIRROR
@@ -645,6 +763,9 @@ static void dt_motor(int on) {
 }
 
 void (*a2_title_hook)(void *wdo, const char *title) = NULL;
+const char *a2_model_name(void) {                /* window title prefix */
+	return g_iie == 2 ? "Reinette //e (enhanced)" : g_iie ? "Reinette //e" : "Reinette ][+";
+}
 
 /* Image format from the file name: .po = ProDOS order, .nib = nibbles, anything
  * else 140 KB (.dsk/.do) = DOS order. */
@@ -732,7 +853,7 @@ int insertFloppy(void *wdo, char *filename, int drv) {
 	while (disk[1].filename[i] != 0)                                              // find start of filename for disk1
 		if (disk[1].filename[i++] == '\\') b = i;
 
-	sprintf(title, "Reinette ][+   D1: %s   D2: %s", disk[0].filename + a, disk[1].filename + b);
+	sprintf(title, "%s   D1: %s   D2: %s", a2_model_name(), disk[0].filename + a, disk[1].filename + b);
 	if (a2_title_hook) a2_title_hook(wdo, title);                                 // updates window title
 
 	return 1;
@@ -1005,6 +1126,9 @@ uint8_t softSwitches(uint16_t address, uint8_t value, bool WRT) {
   		if (g_gpad_en) { if (!g_gp_an1 && g_gpad_idx < 8) g_gpad_idx++; g_gp_an1 = 1; }
   		break;                                                                    //   CLOCK/shift only on low->high edge
 
+  	case 0xC05E: if (g_iie) DHIRES = true;  break;                              // AN3 off: double-res
+  	case 0xC05F: if (g_iie) DHIRES = false; break;                              // AN3 on
+
   	case 0xC061: return PB0;                                                    // Push Button 0
   	case 0xC062: return PB1;                                                    // Push Button 1
   	case 0xC063:                                                                // Push Button 2 / NES 4021 DATA
@@ -1020,6 +1144,9 @@ uint8_t softSwitches(uint16_t address, uint8_t value, bool WRT) {
   	case 0xC067: return readPaddle(3);                                          // Paddle 3
 
   	case 0xC070: resetPaddles(); break;                                         // paddle timer RST
+  	case 0xC071: case 0xC073: case 0xC075: case 0xC077:                         // RamWorks aux bank
+  		if (WRT && g_iie_aux >= 2 && iie_set_auxbank(g_ram2e ? ram2e_write(value) : value)) fetchSyncAll();
+  		break;
 
     case 0xC080:                                                      // LANGUAGE CARD :
   	case 0xC084: LCBK2 = 1; LCRD = 1; LCWR = 0;      LCWFF = 0;    break;       // LC2RD
@@ -1132,6 +1259,132 @@ static inline void cxxx_note(char rw, uint16_t a, uint8_t v) {
 		        rw, a, v, (a >> 8) & 0x0F, a & 0x1F);
 }
 
+//============================================================ NO-SLOT CLOCK
+/* A No-Slot Clock (Dallas DS1216E SmartWatch) under the IIe's CD ROM, seen
+ * through the internal ROM at $C100-$CFFF: the clock is hidden until 64 reads
+ * write its recognition pattern (C5 3A A3 5C C5 3A A3 5C, every byte LSB
+ * first) as address bit A0 of reads with A2 = 0; then 64 reads with A2 = 1
+ * give its registers on D0 (hundredths, seconds, minutes, hours, day of the
+ * week, date, month, year: BCD, LSB first), or 64 reads with A2 = 0 set them.
+ * A read with A2 = 1 while the pattern is coming starts it again.  The usual
+ * driver: STA $C00A (internal $C3 ROM), LDA $C304, the pattern with LDA
+ * $C300 / $C301, the registers with LDA $C304 (libvera src/apple2/rtc.s).
+ *
+ * The time never goes back: it starts from the date saved by the last run
+ * (A2_NSC_FILE, default ~/.config/a2emu-vera/nsc-clock.txt, a line
+ * "YYYY-MM-DD HH:MM:SS"; 1980-01-01 00:00:00 when there is none), runs with
+ * the emulated CPU (a second every A2_CPU_HZ cycles) and is saved there when
+ * the emulator exits.  A program setting the clock moves it forward only.
+ * IIe only; A2_NSC=0: no clock.  Not modelled: the EF ROM socket, the
+ * oscillator / reset bits (always running), 12-hour mode. */
+static int      nsc_state = -1;          /* -1 not set up, 0 off, 1 on */
+static char     nsc_path[1024];
+static time_t   nsc_base;                /* the date at nsc_cyc = 0, UTC as a plain date */
+static unsigned long long nsc_cyc;       /* CPU cycles since nsc_base */
+static unsigned nsc_last;                /* ticks at the last update */
+static int      nsc_match, nsc_xfer;     /* pattern bits seen; 1-64: a transfer under way */
+static uint8_t  nsc_regs[8], nsc_wregs[8];
+static int      nsc_written;
+
+static const uint8_t nsc_pattern[8] = { 0xC5, 0x3A, 0xA3, 0x5C, 0xC5, 0x3A, 0xA3, 0x5C };
+
+static void nsc_update(void) {
+	nsc_cyc += (unsigned)(ticks - nsc_last);    /* wrap-safe while called within ~70 min */
+	nsc_last = ticks;
+}
+static time_t nsc_now(void) {
+	nsc_update();
+	return nsc_base + (time_t)(nsc_cyc / A2_CPU_HZ);
+}
+static void nsc_save(void) {
+	if (nsc_state != 1) return;
+	time_t t = nsc_now();
+	struct tm tm; gmtime_r(&t, &tm);
+	FILE *f = fopen(nsc_path, "w");
+	if (!f) return;
+	fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d\n", tm.tm_year + 1900, tm.tm_mon + 1,
+	        tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+	fclose(f);
+}
+static void nsc_setup(void) {
+	const char *e = getenv("A2_NSC");
+	nsc_state = (g_iie && !(e && !atoi(e))) ? 1 : 0;
+	if (!nsc_state) return;
+	e = getenv("A2_NSC_FILE");
+	if (e) snprintf(nsc_path, sizeof nsc_path, "%s", e);
+	else {
+		const char *h = getenv("HOME");
+		char dir[900];
+		snprintf(dir, sizeof dir, "%s/.config", h ? h : ".");
+		mkdir(dir, 0755);
+		snprintf(dir, sizeof dir, "%s/.config/a2emu-vera", h ? h : ".");
+		mkdir(dir, 0755);
+		snprintf(nsc_path, sizeof nsc_path, "%s/nsc-clock.txt", dir);
+	}
+	struct tm tm = { .tm_year = 80, .tm_mon = 0, .tm_mday = 1 };   /* 1980-01-01 */
+	FILE *f = fopen(nsc_path, "r");
+	if (f) {
+		int y, mo, d, h, mi, sec;
+		if (fscanf(f, "%d-%d-%d %d:%d:%d", &y, &mo, &d, &h, &mi, &sec) == 6) {
+			tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d;
+			tm.tm_hour = h; tm.tm_min = mi; tm.tm_sec = sec;
+		}
+		fclose(f);
+	}
+	nsc_base = timegm(&tm);
+	nsc_cyc = 0;
+	nsc_last = ticks;
+	atexit(nsc_save);
+}
+static uint8_t bcd(int v) { return (uint8_t)(((v / 10) << 4) | (v % 10)); }
+static int unbcd(uint8_t v) { return (v >> 4) * 10 + (v & 15); }
+
+/* a read of the internal ROM at `address` that gives `v`: the clock's bit on D0 */
+static uint8_t nsc_access(uint16_t address, uint8_t v) {
+	if (nsc_state < 0) nsc_setup();
+	if (!nsc_state) return v;
+	int a2 = address & 4, a0 = address & 1;
+	if (!nsc_xfer) {                                       /* the pattern */
+		if (a2) { nsc_match = 0; return v; }
+		int bit = nsc_pattern[nsc_match >> 3] >> (nsc_match & 7) & 1;
+		if (a0 != bit) { nsc_match = 0; return v; }
+		if (++nsc_match < 64) return v;
+		nsc_match = 0;                                     /* recognised: the registers */
+		time_t t = nsc_now();
+		struct tm tm; gmtime_r(&t, &tm);
+		nsc_regs[0] = 0;
+		nsc_regs[1] = bcd(tm.tm_sec);
+		nsc_regs[2] = bcd(tm.tm_min);
+		nsc_regs[3] = bcd(tm.tm_hour);                     /* 24 h */
+		nsc_regs[4] = (uint8_t)(tm.tm_wday + 1);           /* 1-7, oscillator on, no reset */
+		nsc_regs[5] = bcd(tm.tm_mday);
+		nsc_regs[6] = bcd(tm.tm_mon + 1);
+		nsc_regs[7] = bcd(tm.tm_year % 100);
+		memset(nsc_wregs, 0, sizeof nsc_wregs);
+		nsc_written = 0;
+		nsc_xfer = 1;
+		return v;
+	}
+	int i = nsc_xfer - 1;                                  /* a register bit */
+	if (a2) v = (uint8_t)((v & 0xFE) | (nsc_regs[i >> 3] >> (i & 7) & 1));
+	else { nsc_wregs[i >> 3] |= (uint8_t)(a0 << (i & 7)); nsc_written = 1; }
+	if (++nsc_xfer > 64) {
+		nsc_xfer = 0;
+		if (nsc_written) {                                 /* set: forward only */
+			int yy = unbcd(nsc_wregs[7]);
+			struct tm tm = { .tm_year = yy < 80 ? yy + 100 : yy,
+			                 .tm_mon = unbcd(nsc_wregs[6] & 0x1F) - 1,
+			                 .tm_mday = unbcd(nsc_wregs[5] & 0x3F),
+			                 .tm_hour = unbcd(nsc_wregs[3] & 0x3F),
+			                 .tm_min = unbcd(nsc_wregs[2] & 0x7F),
+			                 .tm_sec = unbcd(nsc_wregs[1] & 0x7F) };
+			time_t t = timegm(&tm);
+			if (t >= nsc_now()) { nsc_base = t; nsc_cyc = 0; nsc_last = ticks; }
+		}
+	}
+	return v;
+}
+
 static uint8_t readMemSlow_impl(uint16_t address);
 uint8_t readMemSlow(uint16_t address) {
 	uint8_t v = readMemSlow_impl(address);
@@ -1144,7 +1397,7 @@ static uint8_t readMemSlow_impl(uint16_t address) {
 
 	if (g_iie && address >= 0xC100 && address < 0xD000 &&                        // IIe internal ROM
 	    (address >= 0xC800 || INTCXROM || ((address & 0xFF00) == 0xC300 && !SLOTC3ROM)))
-		return iiecx[address - 0xC000];
+		return nsc_access(address, iiecx[address - 0xC000]);                       // + the No-Slot Clock
 
 	if (address >= ROMSTART) {
 		if (!LCRD)
@@ -1228,8 +1481,9 @@ void writeMemSlow(uint16_t address, uint8_t value) {
  * language-card state (a II+ with LC RAM mapped takes RESET through $FFFC in RAM). */
 void a2_reset(void) {
 	if (g_iie) {
+		if (!g_ram2e) iie_set_auxbank(0);             /* the RAM2E has no reset line */
 		iie_set_altzp(false);
-		S80STORE = RAMRD = RAMWRT = INTCXROM = SLOTC3ROM = S80COL = ALTCHAR = false;
+		S80STORE = RAMRD = RAMWRT = INTCXROM = SLOTC3ROM = S80COL = ALTCHAR = DHIRES = false;
 		LCRD = false; LCBK2 = true; LCWR = true; LCWFF = false;
 		iie_update_memslow();
 	}
@@ -1241,18 +1495,27 @@ void a2_reset(void) {
  * (enhanced: 342-0304 = $C000-$DFFF, 342-0303 = $E000-$FFFF; unenhanced: 342-0135 +
  * 342-0134).  Returns 1 and switches the machine to IIe mode (AKD keyboard on). */
 #include <dirent.h>
-static int read_part(const char *dir, const char *part, uint8_t *buf) {
+static int read_part_n(const char *dir, const char *part, uint8_t *buf, size_t n) {
 	DIR *d = opendir(dir); struct dirent *e; int ok = 0;
 	if (!d) return 0;
 	while ((e = readdir(d))) {
 		if (!strstr(e->d_name, part)) continue;
 		char p[1200]; snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
 		FILE *f = fopen(p, "rb");
-		if (f) { ok = fread(buf, 1, 0x2000, f) == 0x2000; fclose(f); }
+		if (f) { ok = fread(buf, 1, n, f) == n; fclose(f); }
 		if (ok) break;
 	}
 	closedir(d);
 	return ok;
+}
+static int read_part(const char *dir, const char *part, uint8_t *buf) {
+	return read_part_n(dir, part, buf, 0x2000);
+}
+/* IIe video ROM (character generator): enhanced 342-0265 (with MouseText),
+ * unenhanced 342-0133.  The first 2 KB are 256 glyphs x 8 rows, bit 0 = leftmost
+ * dot, bit CLEAR = lit (the video circuit inverts), inverse glyphs stored as such. */
+int a2_load_iie_video_rom(const char *dir, int enhanced, uint8_t *buf) {
+	return read_part_n(dir, enhanced ? "342-0265" : "342-0133", buf, 0x800);
 }
 int a2_load_iie_roms(const char *dir, int enhanced) {
 	static uint8_t cd[0x2000], ef[0x2000];
