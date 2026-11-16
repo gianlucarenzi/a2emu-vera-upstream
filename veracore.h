@@ -77,6 +77,9 @@ void vc_write(vc_t *v, int reg, uint8_t val);
  * Returns nonzero if IRQ line should be asserted. */
 int vc_tick(vc_t *v, int cycles);
 
+/* The frame as drawn so far, 640 x 480 pixels 0xAARRGGBB (A unused). */
+const uint32_t *vc_frame_pixels(void);
+
 /* Render current frame to framebuffer (call once per vsync) */
 void vc_render_frame(vc_t *v);
 
@@ -93,13 +96,25 @@ extern unsigned long vc_vsync_raised;   /* VSYNCs the core has raised (a2run --p
 uint8_t *vc_vram(void);
 uint8_t *vc_palette(void);
 void vc_palette_dirty(void);
+
+/* VeraRenderer: EXACT every line built from VRAM and registers, FAST the
+ * shortcuts (same pixels by design), AUTO (default) EXACT while it costs at
+ * most half a VERA frame and the emulator keeps up with real time, else FAST
+ * (veracore.c).  vc_renderer_parse("exact" | "fast" | "auto") -> mode, -1. */
+#define VC_RENDER_EXACT 0
+#define VC_RENDER_FAST  1
+#define VC_RENDER_AUTO  2
+void vc_set_renderer(int mode);
+int  vc_get_renderer(void);
+int  vc_renderer_parse(const char *name);
 void vc_set_sprite(int idx, const uint8_t *b8);
 void vc_psg_write(uint8_t reg, uint8_t val);
 
 /* Write the VERA state in x16emu -dump V layout (132,878 B); 1 = ok. */
 int vc_dump_state(const char *path);
 
-/* Mix PSG + PCM into an interleaved stereo int16 buffer (num_samples frames). */
-void vc_audio_render(int16_t *buf, int num_samples);
+/* Take up to max_samples interleaved stereo int16 frames of PSG + PCM (48,828 Hz)
+ * that VERA time has produced; returns how many.  vc_tick makes them. */
+int vc_audio_take(int16_t *buf, int max_samples);
 
 #endif

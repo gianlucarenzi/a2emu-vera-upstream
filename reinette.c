@@ -57,17 +57,17 @@ static void sdl_playSound(void) {
 #ifndef MAC_FRONTEND   /* POSIniX/Mac: speaker audio deferred -- avoids pulling
                         * 64-bit float libgcc helpers into the text-mode port */
 	static unsigned int lastTick = 0;
-	static double frac = 0;
+	static double frac = 0;                                                       // the part of a sample carried over
 	static bool SPKR = false;                                                     // $C030 Speaker toggle
 
 	if (!muted) {
 		SPKR = !SPKR;                                                               // toggle speaker state
-		double len = (ticks - lastTick) * (96000.0 / 1020484.0) + frac;
+		double len = (ticks - lastTick) * (96000.0 / 1020484.0) + frac;             // samples at 96 kHz since the last toggle
 		lastTick = ticks;
-		if (len > audioBufferSize) { frac = 0; return; }                            // long gap: queue nothing
+		if (len > audioBufferSize) { frac = 0; return; }                            // long gap: queue nothing (no DC step)
 		Uint32 length = (Uint32)len;
 		frac = len - length;
-		if (SDL_GetQueuedAudioSize(audioDevice) < 96000 / 10)
+		if (SDL_GetQueuedAudioSize(audioDevice) < 96000 / 10)                      // at most 100 ms queued
 			SDL_QueueAudio(audioDevice, audioBuffer[SPKR], length);
 	}
 #endif
@@ -76,11 +76,11 @@ static void sdl_playSound(void) {
 
 
 //==================================================== VERA PSG + PCM AUDIO (E9)
-/* A second SDL device for the card: vc_audio_render at VERA's native 48,828 Hz,
-   S16 stereo (SDL converts to what the hardware takes; the OS mixes it with the
-   speaker device).  Rendered after every emulated chunk, as many samples as the
-   CPU cycles it ran (1,020,484 Hz) are worth; queued unless more than ~0.1 s is
-   already waiting (then dropped, so the sound never lags the picture). */
+/* A second SDL device for the card at VERA's native 48,828 Hz, S16 stereo (SDL
+   converts to what the hardware takes; the OS mixes it with the speaker device).
+   The VERA makes its samples as CPU time passes (vc_audio_take collects them);
+   queued unless more than ~0.1 s is already waiting (then dropped, so the sound
+   never lags the picture). */
 static SDL_AudioDeviceID veraAudio;
 
 static void vera_audio_open(void) {
@@ -120,20 +120,11 @@ static void wav_close(void) {
 	wav_out = NULL;
 }
 
-static void vera_audio_run(void) {
-	static unsigned int last;
-	static int init;
-	static unsigned long long acc;
-	static int16_t buf[2 * 4096];
-	if (!init) { last = ticks; init = 1; }
-	unsigned int d = ticks - last; last = ticks;
-	acc += (unsigned long long)d * 48828125ull;               /* samples x 1000 */
-	unsigned long long n = acc / 1020484000ull;
-	acc %= 1020484000ull;
-	if (n > 4096) n = 4096;
-	if (!n || (!veraAudio && !wav_out)) return;
-	vc_audio_render(buf, (int)n);
-	ym_mix(buf, (int)n, 48828.125);                           /* + the YM2151 (E14) */
+/* queued samples the audio aims for (~60 ms: 3.5 loops) */
+#define AUDIO_TARGET 3000u
+
+static void vera_audio_out(int16_t *buf, int n) {
+	ym_mix(buf, n, 48828.125);                                /* + the YM2151 (E14); 25 MHz / 512 exactly */
 	if (wav_out && !muted) {                                   /* A2_WAV (little-endian host) */
 		fwrite(buf, 4, (size_t)n, wav_out);
 		wav_n += (uint32_t)n;
@@ -145,8 +136,14 @@ static void vera_audio_run(void) {
 		SDL_QueueAudio(veraAudio, buf, (Uint32)n * 4u);
 }
 
-/* audio-locked pacing: queued samples the loop aims for (~60 ms: 3.5 loops) */
-#define AUDIO_TARGET 3000u
+static void vera_audio_run(void) {
+	static int16_t buf[2 * 4096];
+	int n;
+	if (!veraAudio && !wav_out) return;                       /* the VERA runs its audio anyway */
+	while ((n = vc_audio_take(buf, 4096)) > 0)               /* what VERA time has produced */
+		vera_audio_out(buf, n);
+}
+
 static int audio_queued(void) {             /* samples waiting, -1 = no audio device */
 	return veraAudio && !muted ? (int)(SDL_GetQueuedAudioSize(veraAudio) / 4u) : -1;
 }
@@ -238,10 +235,12 @@ int main(int argc, char *argv[]) {
 	a2_speaker_hook = sdl_playSound;                                              // frontend hooks into a2core
 	a2_title_hook   = sdl_title;
 	vera_bus_init();                                                              // g_vera up, responds at $C400-$C41F
-	SDL_Window   *vwdo = SDL_CreateWindow("VERA (a2_vera)", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_SHOWN);
-	SDL_Renderer *vrdr = SDL_CreateRenderer(vwdo, -1, SDL_RENDERER_SOFTWARE);
-	SDL_Texture  *vtex = SDL_CreateTexture(vrdr, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, 640, 480);
-	static uint32_t veraFB[640*480];
+	SDL_Window   *vwdo = SDL_CreateWindow("VERA [A2]", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_SHOWN);
+	/* the GPU scales and shows it; the software renderer only if there is none */
+	SDL_Renderer *vrdr = SDL_CreateRenderer(vwdo, -1, SDL_RENDERER_ACCELERATED);
+	if (!vrdr) vrdr = SDL_CreateRenderer(vwdo, -1, SDL_RENDERER_SOFTWARE);
+	/* XRGB: veracore's pixels go up as they are (no alpha to add) */
+	SDL_Texture  *vtex = SDL_CreateTexture(vrdr, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, 640, 480);
 
 
 	//=================================================== SDL AUDIO INITIALIZATION
@@ -440,8 +439,8 @@ int main(int argc, char *argv[]) {
 	/* real-time pacing: one loop = 17050 CPU cycles = 16.71 ms at 1,020,484 Hz (the rate
 	   the VERA and the audio are timed by, a2core.c A2_CPU_HZ). Vsync alone is not a clock
 	   (compositors may not block, displays may run at 120/144 Hz), so the loop sleeps to
-	   the wall clock, trimmed by the audio queue: the sound card's clock wins, so the
-	   samples never pile up or run dry (no dropped chunks, no wobble). F9 toggles warp. */
+	   the wall clock; the audio follows it (vera_audio_out keeps its queue near
+	   AUDIO_TARGET by dropping / repeating single samples). F9 toggles warp. */
 	const uint64_t pf_hz = SDL_GetPerformanceFrequency();
 	const uint64_t pf_frame = (uint64_t)((double)pf_hz * 17050.0 / 1020484.0);
 	uint64_t pf_next = SDL_GetPerformanceCounter() + pf_frame;
@@ -952,9 +951,7 @@ int main(int argc, char *argv[]) {
 		SDL_RenderPresent(rdr);                                                     // swap buffers
 
 		/* --- composite VERA's current VRAM+palette and show it --- */
-		vc_render_frame(&g_vera);
-		for (int vk = 0; vk < 640*480; vk++) veraFB[vk] = 0xFF000000u | g_vera.framebuffer[vk];
-		SDL_UpdateTexture(vtex, NULL, veraFB, 640*4);
+		SDL_UpdateTexture(vtex, NULL, vc_frame_pixels(), 640*4);
 		SDL_RenderClear(vrdr);
 		SDL_RenderCopy(vrdr, vtex, NULL, NULL);
 		SDL_RenderPresent(vrdr);
@@ -993,15 +990,7 @@ int main(int argc, char *argv[]) {
 				fps_t0 = t; fps_c0 = ticks; fps_v0 = (unsigned)vc_vsync_raised;
 			}
 		}
-		if (!warp && !rv_shotat) {                          /* real-time pacing */
-			int q = audio_queued();                         /* trim by the audio queue: */
-			if (q >= 0) {                                   /* 1/8 of the error per loop, */
-				int64_t e = ((int64_t)q - (int64_t)AUDIO_TARGET) * (int64_t)pf_hz / 48828 / 8;
-				int64_t lim = (int64_t)pf_frame / 4;        /* at most +-25 % of a loop */
-				if (e > lim) e = lim;
-				if (e < -lim) e = -lim;
-				pf_next = (uint64_t)((int64_t)pf_next + e);
-			}
+		if (!warp && !rv_shotat) {                          /* real-time pacing: the wall clock */
 			uint64_t now = SDL_GetPerformanceCounter();
 			if (now < pf_next) {
 				uint64_t ms = (pf_next - now) * 1000 / pf_hz;

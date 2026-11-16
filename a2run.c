@@ -14,13 +14,18 @@
  *     --disk1 F --disk2 F   Disk ][ images (.dsk/.do DOS order, .po ProDOS order, .nib), slot 6;
  *                           written back to their files at exit (E6) unless --no-writeback
  *     --hd F                ProDOS block device in slot 7 (.po/.hdv/.2mg, up to 32 MB): boots first
- *     --sdcard F            raw image in the VERA SD slot (A2_SDCARD)
+ *     --sdcard F            SD card image (raw 512-byte sectors, >= 512 KB) on the VERA's SPI port
+ *                           (default: env A2_SDCARD); written through
  *     --load FILE@ADDR      copy FILE into RAM at ADDR (hex, $ or 0x optional); repeatable
  *     --pc ADDR             start the CPU at ADDR (I=1, SP=$FF) instead of the ROM reset
  *     --cycles N            stop after N CPU cycles (exit 124)
  *     --frames N            stop after N VERA frames (exit 124)
  *     --vera-slot N         VERA card in slot N (1-7, default 4; 0 = no VERA card)
  *     --vera-irq on|off     VERA IRQ -> /IRQ (default on = A2VERA with D1)
+ *     --vera-renderer M     exact | fast | auto (default; env A2_VERA_RENDERER): exact builds
+ *                           every VERA line from VRAM and registers, fast takes the shortcuts
+ *                           (same pixels), auto = exact while it costs at most half a frame
+ *                           and the emulator keeps up with real time
  *     --phantom off|nmos|65c02   6502 dummy-read model (default nmos)
  *     --xmem KB             RAM card ("Slinky") of KB kilobytes (power of two)
  *     --xmem-slot N         its slot (default 5)
@@ -65,6 +70,7 @@
 #include "puce6502.h"
 #include "veracore.h"
 #include "a2core.h"
+#include "sdcard.h"
 #include "a2run_audio.h"
 #include "a2run_input.h"
 #include "ym2151.h"
@@ -211,8 +217,9 @@ int main(int argc, char **argv) {
 	{ const char *sl = strrchr(argv[0], '/');
 	  if (sl) snprintf(romdir, sizeof romdir, "%.*s/rom", (int)(sl - argv[0]), argv[0]);
 	  else snprintf(romdir, sizeof romdir, "rom"); }
-	const char *hd = NULL; int writeback = 1;
+	const char *hd = NULL, *sdcard = NULL; int writeback = 1;
 	const char *disk1 = NULL, *disk2 = NULL, *xmem_img = NULL, *xmem_dump = NULL;
+	const char *vera_renderer = NULL;
 	const char *shot_exit = NULL, *keys = NULL, *loads[32]; int nloads = 0;
 	long pc = -1; unsigned long long max_cycles = 0; long max_frames = 0;
 	int vera_slot = 0, vslot_given = 0, vera_irq = -1, phantom = 1, xmem_kb = 0, xmem_slot = 5, dbg_slot = 3;
@@ -231,7 +238,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(a, "--disk1"))       disk1 = ARG;
 		else if (!strcmp(a, "--disk2"))       disk2 = ARG;
 		else if (!strcmp(a, "--hd"))          hd = ARG;
-		else if (!strcmp(a, "--sdcard"))      setenv("A2_SDCARD", ARG, 1);
+		else if (!strcmp(a, "--sdcard"))      sdcard = ARG;
 		else if (!strcmp(a, "--no-writeback")) writeback = 0;
 		else if (!strcmp(a, "--load"))        { if (nloads < 32) loads[nloads++] = ARG; }
 		else if (!strcmp(a, "--pc"))          pc = parse_addr(ARG);
@@ -239,6 +246,7 @@ int main(int argc, char **argv) {
 		else if (!strcmp(a, "--frames"))      max_frames = atol(ARG);
 		else if (!strcmp(a, "--vera-slot"))   { vera_slot = atoi(ARG); vslot_given = 1; }
 		else if (!strcmp(a, "--vera-irq"))    vera_irq = strcmp(ARG, "off") != 0;
+		else if (!strcmp(a, "--vera-renderer")) vera_renderer = ARG;
 		else if (!strcmp(a, "--phantom"))     { const char *m = ARG; phantom = !strcmp(m, "off") ? 0 : !strcmp(m, "65c02") ? 3 : 1; phantom_given = 1; }
 		else if (!strcmp(a, "--aux"))         aux = ARG;
 		else if (!strcmp(a, "--ram2e-nvm"))   ram2e_nvm = ARG;
@@ -290,9 +298,15 @@ int main(int argc, char **argv) {
 		if (*e == ',') { zpmin_top = (unsigned)strtol(e + 1, NULL, 0); zpmin_arm = 0; }
 	}
 	vera_bus_init();                                  /* env defaults first, then the flags win */
+	if (vera_renderer) {
+		int m = vc_renderer_parse(vera_renderer);
+		if (m < 0) { fprintf(stderr, "a2run: --vera-renderer exact|fast|auto\n"); return 2; }
+		vc_set_renderer(m);
+	}
 	if (vera_slot >= 1 && vera_slot <= 7) g_vera_base = 0xC000 + vera_slot * 0x100;
 	if (vera_slot == 0 && vslot_given) g_vera_enabled = 0;
 	if (vera_irq >= 0) g_vera_irq = vera_irq;
+	if (sdcard && !sdcard_attach(sdcard)) { fprintf(stderr, "a2run: cannot use SD card image %s\n", sdcard); return 2; }
 	if (ym_opt >= 0) ym_init(ym_opt);
 	if (ymlog) ym_log_open(ymlog);
 	g_phantom = phantom;

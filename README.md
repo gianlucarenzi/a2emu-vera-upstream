@@ -33,12 +33,17 @@ Reinette II plus (Apple ][+ / IIe, 65C02) with an A2VERA card: VERA video, PSG a
   `GWRAM.SYSTEM` works: capacity, LED, Apple+number to save, R x25 to erase.  The saved settings go
   to `ram2e.nvm` next to `rom/` (`A2_RAM2E_NVM=FILE`; `a2run --ram2e-nvm FILE`, default: not saved).
   E.g. `./a2emu --model iiee --aux RAM2E GWRAM.po`.
+- VERA slot: `A2_VERA_SLOT=<1-7>` (default 4; `a2run --vera-slot N`), e.g. `A2_VERA_SLOT=5 ./a2emu disk.po`
+  puts the card at $C500-$C51F.  Slot 6 always holds the Disk II and slot 7 the hard disk when one is
+  inserted: their firmware wins the reads there, so the VERA is unreachable there.
 - `make install` copies binaries, `assets/` and `rom/` to `~/.local/share/a2emu-vera` and puts `a2emu`/`a2run`/`a2fs` in `~/bin` (override with `DATADIR=`/`BINDIR=`); `make uninstall` removes them but keeps the installed `rom/`.
 - Keys: Ctrl+F1 / Alt+F1 save the floppy in drive 1 / 2 back to its file, F2 screenshot, F3 paste the clipboard as keystrokes,
   Shift/Ctrl+F4 volume, Shift/Ctrl+F5/F6 joystick release/action speed, Shift/Ctrl+F7 zoom,
   F9 warp, F10 pause, F11 reset, F12 help.
+- SD card: `A2_SDCARD=sd.img` (or `a2run --sdcard sd.img`) puts a raw image of 512-byte sectors (at least 512 KB) on the VERA's SPI port as an SDHC card in SPI mode (CMD0/1/8/9/10/12/13/16/17/18/24/25/55/58/59, ACMD13/23/41/51; written through).  The SPI follows VERA 48.0.1's `spictrl.v` clock by clock: a byte takes 16 VERA clocks, 512 with SLOW.
 - No-Slot Clock (IIe): a Dallas DS1216E SmartWatch under the CD ROM, read through the internal ROM at `$C100-$CFFF` (the usual driver: `STA $C00A`, `LDA $C304`, the 64-bit recognition pattern with `LDA $C300`/`$C301`, then 64 reads of `$C304` on D0; libvera's `plat_rtc`).  Its time never goes back: it starts from the date saved by the last run (`A2_NSC_FILE`, default `~/.config/a2emu-vera/nsc-clock.txt`, a line `YYYY-MM-DD HH:MM:SS`; 1980-01-01 00:00:00 without one), runs with the emulated CPU (a second every 1,020,484 cycles), is saved when the emulator exits, and a program setting it moves it forward only.  `A2_NSC=0`: no clock.
-- Options and the environment variables they set: `--sdcard card.img` (`A2_SDCARD`) puts a raw image in the VERA SD slot, `--wav out.wav` (`A2_WAV`) records the stereo card audio, `--no-speaker` (`A2_SPEAKER=0`) drops the speaker stream, `--fps` (`A2_FPS=1`) prints the emulated clock and frame rate.
+- VERA timing: the VERA catches up to the CPU before every register access and after every instruction (where its IRQ is sampled, as on the 6502); its audio makes a sample every 512 VERA clocks, so the PCM FIFO and AFLOW follow CPU time.  Writes to the composer/layer registers and, unless `A2_VERA_MIDLINE=0`, to VRAM/palette/sprites draw the line up to the beam first: raster effects land on the pixel (x16emu does the VRAM part only with `-midline-effects`).
+- `--wav out.wav` (`A2_WAV`) records the stereo card audio, `--no-speaker` (`A2_SPEAKER=0`) drops the speaker stream, `--fps` (`A2_FPS=1`) prints the emulated clock and the VERA frame rate; `a2run --psgvlog FILE` logs the PSG registers at each VSYNC, before its IRQ.
 - `make install` also installs `a2fs` and the SDK (`a2fs sdk` prints where), for cc65 programs
   booted straight from a Disk II floppy, no DOS:
   - `a2fs mkimage prog.dsk prog.bin [NAME=FILE ...]`: bootable image (`sdk/boot.s` loads the
@@ -51,6 +56,7 @@ Reinette II plus (Apple ][+ / IIe, 65C02) with an A2VERA card: VERA video, PSG a
   - in a project: `SDK := $(shell a2fs sdk)`, then
     `cl65 -t apple2 -C $(SDK)/a2emu-vera.cfg -I $(SDK) -Osir -Cl -o prog.bin main.c $(SDK)/a2fs.c $(SDK)/rwts.s`
     and `a2fs mkimage prog.dsk prog.bin DATA=data.bin`.
+- `examples/sdtest` (`make test`): SD init, CSD, single/multiple block reads and writes over SPI, checked from the host.
 - `examples/ramworks` (`make test`): IIe aux banking for every `--aux` size, and the RAM2E II's
   commands over three power-ons (detection, LED, capacity mask, command timeout, saved settings).
 - `examples/dblres` (`make run`): 16 colour bars in double hi-res, then double lo-res, then plain

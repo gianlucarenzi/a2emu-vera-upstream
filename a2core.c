@@ -39,6 +39,7 @@
 #include "veracore.h"
 #include "a2core.h"
 #include "ym2151.h"
+#include "sdcard.h"
 #include <time.h>
 #include <sys/stat.h>
 
@@ -72,17 +73,31 @@ static int              cvs_init  = 0;
    line to the CPU. The line is level-triggered: while ISR & IEN is nonzero and the
    I flag is clear, the CPU keeps taking the IRQ (puce6502IRQ checks P.I). */
 static int cvs_step1 = -1;               /* A2_STEP1=1: one instruction per step (tracing) */
+
+/* Bring the VERA up to the CPU's current cycle; returns its IRQ line.  Called after
+   every chunk AND before every VERA register access, so a register read sees the
+   VERA (scanline, ISR, SPI busy, ...) as of that instruction, not of the chunk. */
+static int vera_sync(void) {
+	if (!cvs_init) { cvs_last = ticks; cvs_init = 1; }
+	unsigned int d = ticks - cvs_last; cvs_last = ticks;      /* wrap-safe */
+	unsigned long long num = (unsigned long long)d * VC_STEPS_PER_S + cvs_carry;
+	int steps = (int)(num / A2_CPU_HZ); cvs_carry = num % A2_CPU_HZ;
+	return vc_tick(&g_vera, steps);
+}
+
+/* ~32 CPU cycles, one instruction at a time: after each one the VERA catches up and
+   its IRQ line is presented, as the 6502 samples /IRQ at every instruction end. */
 static int nsc_state;                    /* the No-Slot Clock (below) */
 static void nsc_update(void);
 void cpu_vera_step(void) {
 	if (!cvs_init) { cvs_last = ticks; cvs_init = 1; }
-	if (nsc_state == 1) nsc_update();            /* the No-Slot Clock keeps the time */
 	if (cvs_step1 < 0) cvs_step1 = getenv("A2_STEP1") ? 1 : 0;
-	puce6502Exec(cvs_step1 ? 1 : 32);
-	unsigned int d = ticks - cvs_last; cvs_last = ticks;      /* wrap-safe */
-	unsigned long long num = (unsigned long long)d * VC_STEPS_PER_S + cvs_carry;
-	int steps = (int)(num / A2_CPU_HZ); cvs_carry = num % A2_CPU_HZ;
-	if (vc_tick(&g_vera, steps) && g_vera_irq) puce6502IRQ();
+	unsigned int start = ticks;
+	if (nsc_state == 1) nsc_update();            /* the No-Slot Clock keeps the time */
+	do {
+		puce6502Exec(1);
+		if (vera_sync() && g_vera_irq) puce6502IRQ();
+	} while (!cvs_step1 && ticks - start < 32);
 }
 
 /* IIGS speed model . BOTH DEFAULT-OFF. g_cyareg_model = 0 -> $C036 is not modelled at all and... */
@@ -124,6 +139,12 @@ void vera_bus_init(void)
     { const char *e = getenv("A2_VERA_IRQ"); g_vera_irq = e ? atoi(e) : 1;
       e = getenv("A2_VERA_SLOT"); if (e && atoi(e) >= 1 && atoi(e) <= 7) g_vera_base = 0xC000 + atoi(e) * 0x100; }
     vc_init(&g_vera);
+    { const char *e = getenv("A2_VERA_RENDERER");                                // exact | fast | auto (default)
+      if (e && *e) { int m = vc_renderer_parse(e);
+          if (m >= 0) vc_set_renderer(m);
+          else fprintf(stderr, "a2emu: unknown A2_VERA_RENDERER=%s (exact, fast, auto)\n", e); } }
+    { const char *e = getenv("A2_SDCARD");                                       // SD card on the VERA's SPI
+      if (e && *e && !sdcard_attach(e)) fprintf(stderr, "a2emu: cannot use SD card image %s\n", e); }
     { const char *e = getenv("A2_YM"); ym_init(e ? atoi(e) : 1); }               // E14
     if (g_vera.framebuffer == NULL) {
         g_vera.framebuffer = calloc((size_t)VC_SCREEN_W * VC_SCREEN_H, sizeof(uint32_t));
@@ -1417,6 +1438,7 @@ static uint8_t readMemSlow_impl(uint16_t address) {
 
 	if (g_vera_enabled && (address & 0xFFE0) == g_vera_base) {
 		speedlog_note(1, g_cyareg, ticks);                                           // : speed at this access
+		vera_sync();                                                                 // the VERA as of this cycle
 		return vc_read(&g_vera, address & 0x1F);                                     // VERA card ($C400-$C41F)
 	}
 	if (g_vera_enabled && g_ym_enabled && (address & 0xFFFE) == g_vera_base + 0x20)
@@ -1459,6 +1481,7 @@ void writeMemSlow(uint16_t address, uint8_t value) {
 
 	if (g_vera_enabled && (address & 0xFFE0) == g_vera_base) {
 		speedlog_note(1, g_cyareg, ticks);                                           // : speed at this access
+		vera_sync();                                                                 // the VERA as of this cycle
 		vc_write(&g_vera, address & 0x1F, value);                                    // VERA card ($C400-$C41F)
 		return;
 	}

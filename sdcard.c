@@ -1,250 +1,289 @@
-// SD card in SPI mode, backed by a raw image file.
-// From the Commander X16 emulator's sdcard.c
-// Copyright (c) 2019 Michael Steil, (c) 2020 Frank van den Hoef, 2-clause BSD
-#define _FILE_OFFSET_BITS 64
-
+/* sdcard.c -- an SD card in SPI mode, as the VERA's SPI port sees it.
+ *
+ * SDHC (block addressed, CCS = 1), 512-byte blocks, backed by a raw image file
+ * (written through on every block).  Modelled from the SD Physical Layer spec,
+ * SPI mode: every response comes one byte after the command (Ncr = 1) and every
+ * data block one byte after its R1 (Nac = 1), so a host must poll for them as on
+ * a real card.  Command CRCs are not checked (CRC is off in SPI mode); data
+ * blocks carry a real CRC-16.
+ *
+ * Commands: CMD0 CMD1 CMD8 CMD9 CMD10 CMD12 CMD13 CMD16 CMD17 CMD18 CMD24 CMD25
+ * CMD55 CMD58 CMD59, ACMD13 ACMD23 ACMD41 ACMD51.  Writes answer with the data
+ * response token ($05 accepted, $0D on a read-only image) and then a few busy
+ * bytes ($00); CMD25 takes $FC blocks until the $FD stop token.
+ */
+#define _FILE_OFFSET_BITS 64           /* images over 2 GB, also where long is 32 bits */
 #include <stdio.h>
-#include <stdint.h>
-#include <stdbool.h>
 #include <string.h>
+#include <sys/types.h>
 #include "sdcard.h"
 
 #ifdef _MSC_VER
 #define fseeko _fseeki64
 #define ftello _ftelli64
+typedef __int64 off_t;
 #endif
 
-enum {
-	CMD0   = 0,         // GO_IDLE_STATE
-	CMD8   = 8,         // SEND_IF_COND
-	CMD9   = 9,         // SEND_CSD
-	CMD12  = 12,        // STOP_TRANSMISSION
-	CMD13  = 13,        // SEND_STATUS
-	CMD16  = 16,        // SET_BLOCKLEN
-	CMD17  = 17,        // READ_SINGLE_BLOCK
-	CMD18  = 18,        // READ_MULTIPLE_BLOCK
-	CMD24  = 24,        // WRITE_BLOCK
-	CMD55  = 55,        // APP_CMD
-	CMD58  = 58,        // READ_OCR
-	ACMD41 = 0x80 | 41, // SD_SEND_OP_COND
-};
+#define BUSY_BYTES 8                   /* $00s after a block write / CMD12 */
 
-static FILE *card;
-static int64_t card_size;
-bool sdcard_attached;
+static FILE    *img;
+static uint32_t nblocks;
+static int      readonly;
+static int      selected;
+static int      idle = 1;              /* until ACMD41 */
+static int      acmd;                  /* the previous command was CMD55 */
 
-static uint8_t rxbuf[3 + 512];
-static int rxbuf_idx;
-static uint32_t lba;
-static uint8_t last_cmd;
-static bool is_acmd;
-static bool is_idle = true;
-static bool is_initialized;
-static bool multiblock;
-static bool selected;
+static uint8_t  cmd[6];
+static int      cmdlen;
 
-static const uint8_t *response;
-static int response_length;
-static int response_counter;
+static uint8_t  out[600];              /* bytes queued for MISO */
+static int      outpos, outlen;
 
-bool sdcard_attach(const char *path)
+static enum { RX_CMD, RX_WTOKEN, RX_WDATA } rx = RX_CMD;
+static int      wmulti;                /* the write is a CMD25 */
+static uint32_t wlba;
+static uint8_t  wbuf[514];             /* data + CRC */
+static int      wlen;
+
+static int      rmulti;                /* CMD18 streaming */
+static uint32_t rlba;
+
+static uint16_t crc16(const uint8_t *p, int n)
 {
-	sdcard_detach();
-	card = fopen(path, "r+b");
-	if (!card) {
-		fprintf(stderr, "sdcard: can't open %s\n", path);
-		return false;
-	}
-	fseeko(card, 0, SEEK_END);
-	card_size = ftello(card);
-	sdcard_attached = true;
-	is_initialized = false;
-	return true;
+    uint16_t crc = 0;
+    while (n--) {
+        crc ^= (uint16_t)*p++ << 8;
+        for (int b = 0; b < 8; b++)
+            crc = crc & 0x8000 ? (uint16_t)((crc << 1) ^ 0x1021) : (uint16_t)(crc << 1);
+    }
+    return crc;
 }
 
-void sdcard_detach(void)
+static uint8_t crc7(const uint8_t *p, int n)
 {
-	if (card) fclose(card);
-	card = NULL;
-	sdcard_attached = false;
+    uint8_t crc = 0;
+    while (n--) {
+        uint8_t d = *p++;
+        for (int b = 0; b < 8; b++, d <<= 1) {
+            crc <<= 1;
+            if ((d ^ crc) & 0x80) crc ^= 0x09;
+        }
+    }
+    return (uint8_t)((crc << 1) | 1);
 }
 
-void sdcard_select(bool select)
+static void push(uint8_t b)
 {
-	selected = select;
-	rxbuf_idx = 0;
+    if (outlen < (int)sizeof out) out[outlen++] = b;
 }
 
-static void set_response(const uint8_t *r, int len)
+static void push_r1(uint8_t r1)
 {
-	response = r;
-	response_length = len;
+    outpos = outlen = 0;
+    push(0xFF);                        /* Ncr */
+    push(r1);
 }
 
-static void set_response_csd(void)
+static void push_block(const uint8_t *data, int n)
 {
-	static uint8_t rr[] = {
-		0xff, 0xff,       // dummy
-		0x00,             // R1
-		0xff,             // dummy
-		0xfe,             // start block
-		0x40, 0x0e, 0x00, 0x32, 0x5b, 0x59, 0x00,
-		0x00, 0x00, 0x00, // C_SIZE
-		0x7f, 0x80, 0x0a, 0x40, 0x00, 0x01
-	};
-	uint64_t c_size = (card_size >> 19) - 1;  // CSD v2: (C_SIZE + 1) * 512K
-	rr[12] = (c_size >> 16) & 0x3f;
-	rr[13] = (c_size >> 8) & 0xff;
-	rr[14] = c_size & 0xff;
-	set_response(rr, sizeof rr);
+    uint16_t crc = crc16(data, n);
+    push(0xFF);                        /* Nac */
+    push(0xFE);                        /* start block token */
+    for (int i = 0; i < n; i++) push(data[i]);
+    push(crc >> 8);
+    push(crc & 0xFF);
 }
 
-static void set_response_r1(void)
+static int read_lba(uint32_t lba, uint8_t *buf)
 {
-	static uint8_t r1;
-	r1 = is_idle;
-	set_response(&r1, 1);
+    if (lba >= nblocks || fseeko(img, (off_t)lba * 512, SEEK_SET)) return 0;
+    return fread(buf, 1, 512, img) == 512;
 }
 
-static void set_response_r2(void)
+static void push_read(uint32_t lba)
 {
-	static const uint8_t ok[] = {0x00, 0x00}, idle[] = {0x1f, 0xff};
-	set_response(is_initialized ? ok : idle, 2);
+    uint8_t buf[512];
+    if (read_lba(lba, buf)) {
+        push_block(buf, 512);
+    } else {
+        push(0xFF);
+        push(0x08);                    /* data error token: out of range */
+        rmulti = 0;
+    }
 }
 
-// data token + 512 bytes + CRC, or a one-byte error token
-static int load_block(uint8_t *dest)
+static void push_csd(void)
 {
-	if ((int64_t)lba * 512 >= card_size) {
-		dest[0] = 0x08;  // out of range
-		return 1;
-	}
-	dest[0] = 0xfe;
-	fseeko(card, (int64_t)lba * 512, SEEK_SET);
-	if (fread(&dest[1], 1, 512, card) != 512)
-		fprintf(stderr, "sdcard: short read at LBA %u\n", lba);
-	return 1 + 512 + 2;
+    uint32_t c_size = nblocks / 1024 - 1;     /* in 512 KB units */
+    uint8_t csd[16] = {
+        0x40, 0x0E, 0x00, 0x32, 0x5B, 0x59, 0x00,
+        (uint8_t)((c_size >> 16) & 0x3F), (uint8_t)(c_size >> 8), (uint8_t)c_size,
+        0x7F, 0x80, 0x0A, 0x40, 0x00, 0x00 };
+    csd[15] = crc7(csd, 15);
+    push_block(csd, 16);
 }
 
-static uint32_t cmd_arg(void)
+static void push_cid(void)
 {
-	return (uint32_t)rxbuf[1] << 24 | rxbuf[2] << 16 | rxbuf[3] << 8 | rxbuf[4];
+    uint8_t cid[16] = { 0x00, 'A', '2', 'V', 'E', 'R', 'A', ' ', 0x10,
+                        0x12, 0x34, 0x56, 0x78, 0x01, 0x9A, 0x00 };
+    cid[15] = crc7(cid, 15);
+    push_block(cid, 16);
 }
 
 static void command(void)
 {
-	static uint8_t r3[] = {0x00, 0xc0, 0xff, 0x80, 0x00};  // R1 + OCR (CCS = 1)
-	static const uint8_t r7[] = {0x01, 0x00, 0x00, 0x01, 0xaa};
-	static const uint8_t bad_lba[] = {0x00, 0x08};
-	static uint8_t block[1 + 1 + 512 + 2];
+    uint8_t  idx = cmd[0] & 0x3F;
+    uint32_t arg = (uint32_t)cmd[1] << 24 | (uint32_t)cmd[2] << 16 | (uint32_t)cmd[3] << 8 | cmd[4];
+    uint8_t  r1  = idle ? 0x01 : 0x00;
+    int      was_acmd = acmd;
 
-	rxbuf[0] &= 0x3f;
-	if (is_acmd) {
-		rxbuf[0] |= 0x80;
-		is_acmd = false;
-	}
-	last_cmd = rxbuf[0];
-
-	switch (rxbuf[0]) {
-	case CMD0:
-		is_idle = true;
-		set_response_r1();
-		break;
-	case CMD8:
-		set_response(r7, sizeof r7);
-		break;
-	case CMD9:
-		set_response_csd();
-		break;
-	case ACMD41:
-		is_idle = false;
-		is_initialized = true;
-		set_response_r1();
-		break;
-	case CMD12:
-		multiblock = false;
-		set_response_r1();
-		break;
-	case CMD13:
-		set_response_r2();
-		break;
-	case CMD18:
-		multiblock = true;
-		/* fall through */
-	case CMD17:
-		lba = cmd_arg();
-		block[0] = 0;  // R1
-		set_response(block, 1 + load_block(&block[1]));
-		if (response_length == 2) multiblock = false;
-		break;
-	case CMD24:
-		lba = cmd_arg();
-		if ((int64_t)lba * 512 >= card_size)
-			set_response(bad_lba, sizeof bad_lba);
-		else
-			set_response_r1();
-		break;
-	case CMD55:
-		is_acmd = true;
-		set_response_r1();
-		break;
-	case CMD58:
-		r3[0] = is_idle;
-		set_response(r3, sizeof r3);
-		break;
-	default:  // CMD16 and anything else: just R1
-		set_response_r1();
-		break;
-	}
-	response_counter = 0;
+    acmd = 0;
+    if (was_acmd) {
+        switch (idx) {
+        case 41: idle = 0; push_r1(0x00); return;                      /* SD_SEND_OP_COND */
+        case 23: push_r1(r1); return;                                  /* SET_WR_BLK_ERASE_COUNT */
+        case 13: push_r1(r1); push(0x00);                              /* SD_STATUS: R2 + 64 bytes */
+                 { uint8_t st[64] = { 0 }; push_block(st, 64); } return;
+        case 51: push_r1(r1);                                          /* SEND_SCR */
+                 { uint8_t scr[8] = { 0x02, 0x35, 0x80, 0, 0, 0, 0, 0 }; push_block(scr, 8); } return;
+        }                                                              /* else: as a plain command */
+    }
+    switch (idx) {
+    case 0:  idle = 1; rmulti = 0; push_r1(0x01); break;               /* GO_IDLE_STATE */
+    case 1:  idle = 0; push_r1(0x00); break;                           /* SEND_OP_COND (MMC) */
+    case 8:  push_r1(r1); push(0x00); push(0x00);                      /* SEND_IF_COND: R7 */
+             push(cmd[3] & 0x0F); push(cmd[4]); break;
+    case 9:  push_r1(r1); push_csd(); break;
+    case 10: push_r1(r1); push_cid(); break;
+    case 12: rmulti = 0; outpos = outlen = 0;                          /* STOP_TRANSMISSION: R1b */
+             push(0xFF); push(r1);
+             for (int i = 0; i < BUSY_BYTES; i++) push(0x00);
+             break;
+    case 13: push_r1(r1); push(0x00); break;                           /* SEND_STATUS: R2 */
+    case 16: push_r1(arg == 512 ? r1 : (uint8_t)(r1 | 0x40)); break;   /* SET_BLOCKLEN */
+    case 17:                                                           /* READ_SINGLE_BLOCK */
+    case 18:                                                           /* READ_MULTIPLE_BLOCK */
+        if (arg >= nblocks) { push_r1(r1 | 0x20); break; }             /* address error */
+        push_r1(r1);
+        push_read(arg);
+        rmulti = idx == 18;
+        rlba = arg + 1;
+        break;
+    case 24:                                                           /* WRITE_BLOCK */
+    case 25:                                                           /* WRITE_MULTIPLE_BLOCK */
+        if (arg >= nblocks) { push_r1(r1 | 0x20); break; }
+        push_r1(r1);
+        rx = RX_WTOKEN;
+        wmulti = idx == 25;
+        wlba = arg;
+        break;
+    case 55: acmd = 1; push_r1(r1); break;                             /* APP_CMD */
+    case 58: push_r1(r1);                                              /* READ_OCR: R3 */
+             push(idle ? 0x40 : 0xC0); push(0xFF); push(0x80); push(0x00); break;
+    case 59: push_r1(r1); break;                                       /* CRC_ON_OFF */
+    default: push_r1(r1 | 0x04); break;                                /* illegal command */
+    }
 }
 
-static void next_response_byte(uint8_t *out)
+static void write_block(void)
 {
-	static uint8_t next[1 + 512 + 2];
-
-	*out = response[response_counter++];
-	if (response_counter < response_length) return;
-	if (multiblock) {
-		lba++;
-		response_length = load_block(next);
-		if (response_length == 1) multiblock = false;
-		response = next;
-		response_counter = 0;
-	} else
-		response = NULL;
+    uint8_t token = 0x05;                                              /* data accepted */
+    if (readonly || wlba >= nblocks || fseeko(img, (off_t)wlba * 512, SEEK_SET)
+        || fwrite(wbuf, 1, 512, img) != 512) {
+        token = 0x0D;                                                  /* write error */
+    } else {
+        fflush(img);
+    }
+    outpos = outlen = 0;
+    push(token);
+    for (int i = 0; i < BUSY_BYTES; i++) push(0x00);
+    wlba++;
 }
 
-uint8_t sdcard_handle(uint8_t inbyte)
+static void receive(uint8_t in)
 {
-	uint8_t out = 0xff;
+    switch (rx) {
+    case RX_WTOKEN:
+        if (in == 0xFE || (wmulti && in == 0xFC)) {
+            rx = RX_WDATA;
+            wlen = 0;
+        } else if (wmulti && in == 0xFD) {                             /* stop tran token */
+            rx = RX_CMD;
+            outpos = outlen = 0;
+            push(0xFF);
+            for (int i = 0; i < BUSY_BYTES; i++) push(0x00);
+        }
+        return;
+    case RX_WDATA:
+        wbuf[wlen++] = in;
+        if (wlen == (int)sizeof wbuf) {
+            write_block();
+            rx = wmulti ? RX_WTOKEN : RX_CMD;
+        }
+        return;
+    case RX_CMD:
+        if (cmdlen == 0 && (in & 0xC0) != 0x40) return;                /* not a command start */
+        cmd[cmdlen++] = in;
+        if (cmdlen == 6) {
+            cmdlen = 0;
+            command();
+        }
+        return;
+    }
+}
 
-	if (!selected || !card) return 0xff;
+uint8_t sdcard_xfer(uint8_t in)
+{
+    uint8_t o = 0xFF;
 
-	if (rxbuf_idx == 0 && inbyte == 0xff) {
-		if (response) next_response_byte(&out);
-		return out;
-	}
+    if (!img || !selected) return 0xFF;
+    if (outpos < outlen) {
+        o = out[outpos++];
+        if (outpos == outlen) {
+            outpos = outlen = 0;
+            if (rmulti) push_read(rlba++);                             /* CMD18: next block */
+        }
+    }
+    receive(in);
+    return o;
+}
 
-	rxbuf[rxbuf_idx++] = inbyte;
-	if ((rxbuf[0] & 0xc0) == 0x40 && rxbuf_idx == 6) {
-		rxbuf_idx = 0;
-		command();
-	} else if (rxbuf_idx == 515) {  // start token + 512 bytes + CRC
-		rxbuf_idx = 0;
-		if (last_cmd == CMD24 && rxbuf[0] == 0xfe && (int64_t)lba * 512 < card_size) {
-			// data response xxx0 0101 = accepted (xxx0 1101 = write error),
-			// then the card holds the line low (busy) for a few bytes
-			static const uint8_t accepted[] = {0x05, 0x00, 0x00, 0x00};
-			static const uint8_t rejected[] = {0x0d};
-			fseeko(card, (int64_t)lba * 512, SEEK_SET);
-			if (fwrite(rxbuf + 1, 1, 512, card) != 512 || fflush(card)) {
-				fprintf(stderr, "sdcard: short write at LBA %u\n", lba);
-				set_response(rejected, sizeof rejected);
-			} else
-				set_response(accepted, sizeof accepted);
-			response_counter = 0;
-		}
-	}
-	return out;
+void sdcard_select(int sel)
+{
+    if (sel && !selected) cmdlen = 0;  /* a new transaction starts with a new command */
+    selected = sel;
+}
+
+int sdcard_attach(const char *path)
+{
+    off_t size;
+
+    sdcard_detach();
+    readonly = 0;
+    if (!(img = fopen(path, "r+b"))) {
+        if (!(img = fopen(path, "rb"))) return 0;
+        readonly = 1;
+    }
+    if (fseeko(img, 0, SEEK_END) || (size = ftello(img)) < 512 * 1024) {
+        fclose(img);
+        img = NULL;
+        return 0;                       /* too small for an SDHC CSD */
+    }
+    nblocks = (uint32_t)(size / 512);
+    idle = 1;
+    acmd = cmdlen = outpos = outlen = rmulti = 0;
+    rx = RX_CMD;
+    return 1;
+}
+
+void sdcard_detach(void)
+{
+    if (img) fclose(img);
+    img = NULL;
+}
+
+int sdcard_present(void)
+{
+    return img != NULL;
 }

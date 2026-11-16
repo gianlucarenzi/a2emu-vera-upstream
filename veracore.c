@@ -10,7 +10,7 @@
  * All rights reserved. License: 2-clause BSD
  *
  * Includes: video rendering (layers, sprites, compositor), FX extensions,
- * PSG synthesizer (16 channels), PCM audio with FIFO, SPI with SD card.
+ * PSG synthesizer (16 channels), PCM audio with FIFO, SPI stub.
  */
 
 #include <stdio.h>
@@ -32,9 +32,9 @@ void puce6502GetState(Puce6502State*);
  * Build configuration
  * ================================================================ */
 
-#define VC_VERSION_MAJOR  47
+#define VC_VERSION_MAJOR  48            /* VERA 48.0.1, the HDL this core follows */
 #define VC_VERSION_MINOR  0
-#define VC_VERSION_PATCH  2
+#define VC_VERSION_PATCH  1
 
 /* VRAM address ranges */
 #define ADDR_VRAM_START     0x00000
@@ -120,11 +120,9 @@ psg_reset(void)
 
 uint8_t vc_psg_peak[16];
 uint8_t vc_dbg_psg_peak(int ch){ return vc_psg_peak[ch & 15]; }
-static void audio_render(void);
 static void
 psg_writereg(uint8_t reg, uint8_t val)
 {
-    audio_render();
     reg &= 0x3f;
     int ch  = reg / 4;
     int idx = reg & 3;
@@ -200,7 +198,7 @@ static unsigned pcm_fifo_cnt;
 
 static uint8_t pcm_ctrl;
 static uint8_t pcm_rate;
-static uint8_t pcm_rate_reg;    /* as written, reads back unclamped */
+static uint8_t pcm_rate_reg;    /* as written: reads back unclamped */
 static uint8_t pcm_loop;
 
 static uint8_t pcm_volume_lut[16] = {0, 1, 2, 3, 4, 5, 6, 8, 11, 14, 18, 23, 30, 38, 49, 64};
@@ -289,163 +287,182 @@ static bool pcm_is_fifo_almost_empty(void)
     return pcm_fifo_cnt < 1024;
 }
 
-extern unsigned int ticks;
-
-#define AUD_RING 8192
-#define AUD_LAG  4
-
-static int16_t  aud_ring[AUD_RING][2];
-static unsigned aud_rd, aud_wr, aud_last;
-static unsigned long long aud_acc;
-
-static void audio_sample(int16_t *out)
+/* audio_render_samples -- PSG + PCM, num_samples stereo int16 frames at the VERA's
+ * 25 MHz / 512 = 48,828 Hz.  Only audio_clock calls it, as VERA time passes. */
+static void audio_render_samples(int16_t *buf, int num_samples)
 {
-    int16_t psg[2];
-    psg_render(psg, 1);
+    /* audio diag stderr spam removed */
+    for (int i = 0; i < num_samples; i++) {
+        int16_t psg_buf[2];
+        psg_render(psg_buf, 1);
 
-    if (pcm_rate > 0) {
-        pcm_phase += pcm_rate;
-        if (pcm_phase >= 128) {
-            pcm_phase -= 128;
-            if (pcm_fifo_cnt > 0) {
-                switch (pcm_ctrl & 0x30) {
-                    case 0x00:
-                        pcm_cur_l = pcm_cur_r = (int8_t)pcm_read_fifo() * 256;
-                        break;
-                    case 0x10:
-                        pcm_cur_l = (int8_t)pcm_read_fifo() * 256;
-                        pcm_cur_r = (int8_t)pcm_read_fifo() * 256;
-                        break;
-                    case 0x20:
-                        pcm_cur_l  = pcm_read_fifo();
+        /* PCM: consume samples from FIFO at pcm_rate.
+         * Rate 0 = off. Rate N = N * 25MHz/65536 ≈ N * 381 Hz.
+         * At rate 128: ~48828 Hz (matches our base rate). */
+        int16_t pcm_l = pcm_cur_l;
+        int16_t pcm_r = pcm_cur_r;
+
+        if (pcm_rate > 0) {
+            pcm_phase += pcm_rate;
+            if (pcm_phase >= 128) {
+                pcm_phase -= 128;
+                if (pcm_fifo_cnt > 0) {
+                    /* FIFO byte order (HDL audio/pcm.v): left low, left high (16-bit),
+                       then right low, right high (stereo).  A partial sample left in
+                       the FIFO is dropped, as x16emu does. */
+                    unsigned need = ((pcm_ctrl & 0x20) ? 2 : 1) * ((pcm_ctrl & 0x10) ? 2 : 1);
+                    if (pcm_fifo_cnt < need) {
+                        pcm_fifo_cnt = 0;
+                        pcm_fifo_rdidx = pcm_fifo_wridx;
+                    } else if (pcm_ctrl & 0x20) {
+                        pcm_cur_l = pcm_read_fifo();
                         pcm_cur_l |= pcm_read_fifo() << 8;
-                        pcm_cur_r  = pcm_cur_l;
-                        break;
-                    case 0x30:
-                        pcm_cur_l  = pcm_read_fifo();
-                        pcm_cur_l |= pcm_read_fifo() << 8;
-                        pcm_cur_r  = pcm_read_fifo();
-                        pcm_cur_r |= pcm_read_fifo() << 8;
-                        break;
+                        if (pcm_ctrl & 0x10) {
+                            pcm_cur_r = pcm_read_fifo();
+                            pcm_cur_r |= pcm_read_fifo() << 8;
+                        } else {
+                            pcm_cur_r = pcm_cur_l;
+                        }
+                    } else {
+                        pcm_cur_l = (int16_t)(pcm_read_fifo() << 8);
+                        pcm_cur_r = (pcm_ctrl & 0x10) ? (int16_t)(pcm_read_fifo() << 8) : pcm_cur_l;
+                    }
+                } else if (pcm_loop) {
+                    pcm_fifo_restart();
                 }
-            } else if (pcm_loop) {
-                pcm_fifo_restart();
+                pcm_l = pcm_cur_l;
+                pcm_r = pcm_cur_r;
             }
         }
-    }
 
-    int vol = pcm_volume_lut[pcm_ctrl & 0x0F];
-    int l = psg[0] + ((pcm_cur_l * vol) >> 6);
-    int r = psg[1] + ((pcm_cur_r * vol) >> 6);
-    out[0] = l < -32768 ? -32768 : l > 32767 ? 32767 : l;
-    out[1] = r < -32768 ? -32768 : r > 32767 ? 32767 : r;
-}
+        /* Apply PCM volume (4-bit, from ctrl bits 3:0) */
+        int vol = pcm_volume_lut[pcm_ctrl & 0x0F];
+        pcm_l = (pcm_l * vol) >> 6;
+        pcm_r = (pcm_r * vol) >> 6;
 
-/* render the samples owed up to the current CPU cycle (25 MHz / 512 per sample) */
-static void audio_render(void)
-{
-    unsigned d = ticks - aud_last;
-    aud_last = ticks;
-    aud_acc += (unsigned long long)d * 48828125ull;
-    while (aud_acc >= 1020484000ull) {
-        aud_acc -= 1020484000ull;
-        if (aud_wr - aud_rd >= AUD_RING) aud_rd++;
-        audio_sample(aud_ring[aud_wr++ % AUD_RING]);
+        /* Mix PSG + PCM, clamped (the sum would wrap around in int16) */
+        int l = psg_buf[0] + pcm_l, r = psg_buf[1] + pcm_r;
+        buf[i * 2 + 0] = (int16_t)(l < -32768 ? -32768 : l > 32767 ? 32767 : l);
+        buf[i * 2 + 1] = (int16_t)(r < -32768 ? -32768 : r > 32767 ? 32767 : r);
     }
 }
 
-static void audio_reset(void)
+/* The audio runs on VERA time: one sample every 512 VERA clocks (audio.v's
+ * next_sample), so the PCM FIFO drains, and AFLOW changes, at the right moment
+ * whether or not anybody listens.  Samples wait in a ring for vc_audio_take();
+ * if nobody takes them the oldest are overwritten. */
+#define AUDIO_RING 8192
+static int16_t  audio_ring[AUDIO_RING * 2];
+static unsigned audio_ring_wr, audio_ring_cnt;
+static unsigned audio_clk;              /* VERA clocks towards the next sample */
+
+static void audio_clock(unsigned clocks)
 {
-    memset(aud_ring, 0, sizeof(aud_ring));
-    aud_rd = 0;
-    aud_wr = AUD_LAG;
-    aud_last = ticks;
-    aud_acc = 0;
+    audio_clk += clocks;
+    while (audio_clk >= 512) {
+        audio_clk -= 512;
+        audio_render_samples(&audio_ring[audio_ring_wr * 2], 1);
+        audio_ring_wr = (audio_ring_wr + 1) % AUDIO_RING;
+        if (audio_ring_cnt < AUDIO_RING) audio_ring_cnt++;
+    }
 }
 
-/* vc_audio_render — the PSG + PCM samples up to now, 48,828 Hz stereo */
-void vc_audio_render(int16_t *buf, int num_samples)
+int vc_audio_take(int16_t *buf, int max_samples)
 {
-    audio_render();
-    for (int i = 0; i < num_samples; i++) {
-        unsigned k = (aud_wr - aud_rd > 0 ? aud_rd++ : aud_wr - 1) % AUD_RING;
-        buf[i * 2 + 0] = aud_ring[k][0];
-        buf[i * 2 + 1] = aud_ring[k][1];
+    int n = max_samples < (int)audio_ring_cnt ? max_samples : (int)audio_ring_cnt;
+    unsigned rd = (audio_ring_wr + AUDIO_RING - audio_ring_cnt) % AUDIO_RING;
+
+    for (int i = 0; i < n; i++, rd = (rd + 1) % AUDIO_RING) {
+        buf[i * 2 + 0] = audio_ring[rd * 2 + 0];
+        buf[i * 2 + 1] = audio_ring[rd * 2 + 1];
     }
-    if (aud_wr - aud_rd > 48828 / 30) aud_rd = aud_wr - AUD_LAG;
+    audio_ring_cnt -= n;
+    return n;
 }
 
 /* ================================================================
- * SPI master and SD card slot
- * From vera_spi.c, Copyright (c) 2019 Michael Steil, 2-clause BSD
+ * SPI -- spi/spictrl.v of VERA 48.0.1, clocked by the 25 MHz VERA clock.
+ * A byte is 8 bits x 2 SCK edges: SCK toggles every clock (16 clocks per
+ * byte, 0.64 us) or, with SLOW, every 32 clocks of a free-running 5-bit
+ * divider (512 clocks, 20.48 us).  MISO is sampled on the rising edge, MOSI
+ * shifts on the falling edge, BUSY = bit counter != 0, SPI_DATA reads the
+ * receive shift register (so a read during a transfer sees the bits so far),
+ * and a transfer requested while BUSY is ignored.  The SD card (sdcard.c)
+ * answers a whole byte at the start of each transfer.
  * ================================================================ */
 
-/* a byte takes 8 SPI clocks: 12.5 MHz is under one CPU cycle, 390 kHz about 21 */
-#define SPI_CYCLES_FAST 1
-#define SPI_CYCLES_SLOW 21
-
-static bool     spi_ss;
-static bool     spi_busy;
-static bool     spi_autotx;
-static bool     spi_slow;
-static uint8_t  spi_sending_byte;
-static uint8_t  spi_received_byte;
-static unsigned spi_start;
+static bool    spi_select, spi_slow, spi_autotx;
+static uint8_t spi_tx, spi_rx;          /* tx_shift_r, rx_shift_r */
+static uint8_t spi_miso_byte;           /* what the card drives during this byte */
+static uint8_t spi_bitcnt;              /* bitcnt_r: busy while nonzero */
+static uint8_t spi_div;                 /* div_cnt_r */
+static bool    spi_clk;                 /* clk_r (SCK) */
+static double  vera_clk_carry;          /* fraction of a 25 MHz clock not yet run (SPI, audio) */
 
 static void vera_spi_init(void)
 {
-    if (spi_ss) sdcard_select(false);
-    spi_ss = false;
-    spi_busy = false;
-    spi_autotx = false;
-    spi_slow = false;
-    spi_received_byte = 0xff;
+    spi_select = spi_slow = spi_autotx = false;
+    spi_tx = spi_rx = 0;
+    spi_bitcnt = spi_div = 0;
+    spi_clk = false;
+    vera_clk_carry = 0;
+    sdcard_select(0);
 }
 
-static void spi_start_byte(uint8_t b)
+static void spi_start(uint8_t value)
 {
-    spi_sending_byte = b;
-    spi_busy = true;
-    spi_start = ticks;
+    if (spi_bitcnt) return;             /* txstart is ignored while busy */
+    spi_tx = value;
+    spi_bitcnt = 8;
+    spi_miso_byte = spi_select ? sdcard_xfer(value) : 0xFF;   /* no card: MISO pulled up */
 }
 
-static void spi_update(void)
+/* advance the SPI controller by n VERA clocks */
+static void vera_spi_step(unsigned n)
 {
-    if (spi_busy && ticks - spi_start >= (spi_slow ? SPI_CYCLES_SLOW : SPI_CYCLES_FAST)) {
-        spi_busy = false;
-        spi_received_byte = sdcard_attached ? sdcard_handle(spi_sending_byte) : 0xff;
+    while (n && spi_bitcnt) {
+        if (!spi_slow || spi_div == 31) {
+            if (spi_clk) {              /* falling edge: shift out, count the bit */
+                spi_tx <<= 1;
+                spi_bitcnt--;
+            } else {                    /* rising edge: sample MISO */
+                spi_rx = (uint8_t)((spi_rx << 1) | ((spi_miso_byte >> (spi_bitcnt - 1)) & 1));
+            }
+            spi_clk = !spi_clk;
+        }
+        spi_div = (spi_div + 1) & 31;
+        n--;
     }
+    spi_div = (spi_div + n) & 31;       /* idle: only the divider runs */
 }
 
 static uint8_t vera_spi_read(uint8_t reg)
 {
-    spi_update();
     switch (reg) {
         case 0: {
-            uint8_t b = spi_received_byte;
-            if (spi_autotx && !spi_busy) spi_start_byte(0xff);
-            return b;
+            uint8_t v = spi_rx;
+            if (spi_autotx) spi_start(0xFF);
+            return v;
         }
         case 1:
-            return (spi_busy << 7) | (spi_autotx << 2) | (spi_slow << 1) | spi_ss;
+            return (spi_bitcnt ? 0x80 : 0) | (spi_autotx << 2) | (spi_slow << 1) | spi_select;
     }
     return 0;
 }
 
 static void vera_spi_write(uint8_t reg, uint8_t value)
 {
-    spi_update();
     switch (reg) {
         case 0:
-            if (!spi_busy) spi_start_byte(value);
+            spi_start(value);
             break;
         case 1:
-            if (spi_ss != (value & 1)) {
-                spi_ss = value & 1;
-                sdcard_select(spi_ss);
-            }
-            spi_slow = !!(value & 2);
             spi_autotx = !!(value & 4);
+            spi_slow   = !!(value & 2);
+            if (spi_select != (value & 1)) {
+                spi_select = value & 1;
+                sdcard_select(spi_select);
+            }
             break;
     }
 }
@@ -494,14 +511,31 @@ uint8_t vc_dbg_ctrl(void) { return (uint8_t)((io_dcsel << 1) | io_addrsel); }
 uint8_t vc_dbg_layer(int l, int r) { return reg_layer[l & 1][r % 7]; }
 
 static uint8_t layer_line[2][SCREEN_WIDTH];
+
+/* The layer and sprite line buffers are built at a line change from the VRAM
+ * and the registers.  Two shortcuts, with the same picture:
+ *  - a tile layer is decoded only as far as the composer reads it with the
+ *    HSCALE / HSTART / HSTOP of the build (320 of 640 pixels at 2x), up to
+ *    layer_w[]; the first register write after the build (which may change
+ *    them, or the VRAM and the layer registers) completes the line first;
+ *  - an output line that shows the same source line as the line before
+ *    (VSCALE < 128), with no register write in between, keeps the buffers.
+ * vc_wver counts the writes that can change what a line shows. */
+static unsigned vc_wver;
+static int      layer_w[2];             /* layer_line[l][0..layer_w[l]-1] valid */
+static int      line_built_y = -1;      /* the source line in the buffers, -1 none */
+static unsigned line_built_wver;
+static uint8_t  line_built_en;
+/* the output line composed last in one go (VGA), for the copy of a line that
+ * shows the same source line with nothing written in between */
+static int      comp_y = -1;
+static unsigned comp_wver;
+static int      comp_src;
+static int      line_src;               /* the source line of the current output line */
 static uint8_t sprite_line_col[SCREEN_WIDTH];
 static uint8_t sprite_line_z[SCREEN_WIDTH];
 static uint8_t sprite_line_mask[SCREEN_WIDTH];
 static uint8_t sprite_line_collisions;
-static bool layer_line_enable[2];
-static bool old_layer_line_enable[2];
-static bool old_sprite_line_enable;
-static bool sprite_line_enable;
 
 /* ---- FX registers ---- */
 static uint8_t  fx_addr1_mode;
@@ -541,6 +575,103 @@ static const uint8_t vera_version_string[] = {
 static float    vga_scan_pos_x;
 static uint16_t vga_scan_pos_y;
 int vc_norender = 0;             /* set to skip the scanline renderer (measurements): vsync still fires, framebuffer isn't drawn */
+
+/* VeraRenderer (veracore.h vc_set_renderer): EXACT builds every line from the
+ * VRAM and the registers (no source line kept, tile layers decoded to the full
+ * width, no composed row copied); FAST takes those shortcuts (the same pixels:
+ * any write that can change a line drops them, f9eb86e); AUTO starts EXACT and
+ * keeps it while it costs at most half a VERA frame of host time and the
+ * emulator keeps up with real time, else FAST, tried again every 10 s (the
+ * same rule as the VICE and atari800 forks, vera_video.c) */
+#include <time.h>
+#define VC_AUTO_FRAMES 180
+#define VC_AUTO_PROBE  30
+#define VC_AUTO_PERIOD 600
+#define VC_AUTO_BUDGET 0.5
+#define VC_FRAME_MS    16.8
+static int    vc_mode = VC_RENDER_AUTO;
+static int    vc_exact = 1;
+static int    vc_auto_frames, vc_auto_probe, vc_auto_wn;
+static int    vc_auto_shown = -1;
+static double vc_auto_ns, vc_auto_wall, vc_auto_last;
+
+static double vc_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1e9 + (double)ts.tv_nsec;
+}
+
+static void vc_auto_reset(void)
+{
+    vc_auto_frames = 0;
+    vc_auto_ns = vc_auto_wall = 0.0;
+    vc_auto_wn = 0;
+}
+
+static void vc_auto_set(int exact, double ms, double wall)
+{
+    if (exact != vc_auto_shown)
+        fprintf(stderr, "VERA renderer auto: exact costs %.2f ms a frame, a frame every %.2f ms -> %s\n",
+                ms, wall, exact ? "exact" : "fast");
+    vc_auto_shown = exact;
+    vc_exact = exact;
+    vc_auto_reset();
+}
+
+static void vc_auto_frame(void)
+{
+    const double budget = VC_AUTO_BUDGET * VC_FRAME_MS;
+    double now = vc_now_ns(), ms, wall;
+    int behind;
+
+    if (vc_auto_last > 0.0 && now - vc_auto_last < 100e6) {
+        vc_auto_wall += now - vc_auto_last;
+        vc_auto_wn++;
+    }
+    vc_auto_last = now;
+    vc_auto_frames++;
+    if (vc_exact && vc_auto_frames >= (vc_auto_probe ? VC_AUTO_PROBE : VC_AUTO_FRAMES)) {
+        ms = vc_auto_ns / vc_auto_frames / 1e6;
+        wall = vc_auto_wn ? vc_auto_wall / vc_auto_wn / 1e6 : VC_FRAME_MS;
+        behind = wall > VC_FRAME_MS * 1.03;
+        if (vc_auto_probe) {
+            vc_auto_probe = 0;
+            vc_auto_set(ms < 0.7 * budget && !behind, ms, wall);
+        } else {
+            vc_auto_set(ms <= budget && !behind, ms, wall);
+        }
+    } else if (!vc_exact && vc_auto_frames >= VC_AUTO_PERIOD) {
+        vc_exact = 1;                           /* the probe (vc_auto_shown stays FAST) */
+        vc_auto_probe = 1;
+        vc_auto_reset();
+    }
+}
+
+void vc_set_renderer(int mode)
+{
+    if (mode < VC_RENDER_EXACT || mode > VC_RENDER_AUTO)
+        return;
+    vc_mode = mode;
+    vc_exact = mode != VC_RENDER_FAST;
+    vc_auto_probe = 0;
+    vc_auto_shown = mode == VC_RENDER_AUTO ? -1 : vc_exact;
+    vc_auto_reset();
+}
+
+int vc_get_renderer(void)
+{
+    return vc_exact ? VC_RENDER_EXACT : VC_RENDER_FAST;
+}
+
+int vc_renderer_parse(const char *name)
+{
+    static const char *const names[] = { "exact", "fast", "auto" };
+    for (int i = 0; i < 3; i++)
+        if (name && strcmp(name, names[i]) == 0)
+            return i;
+    return -1;
+}
 static float    ntsc_half_cnt;
 static uint16_t ntsc_scan_pos_y;
 static uint16_t ntsc_y_counter, ntsc_y_counter_prev;  /* composer line counter, steps by 2 */
@@ -548,6 +679,11 @@ static bool     ntsc_field;
 static int      frame_count;
 
 static uint8_t framebuffer[SCREEN_WIDTH * SCREEN_HEIGHT * 4];
+/* the last finished frame, copied at VSYNC (vc_frame_pixels): the window shows
+   whole frames, never one half drawn (2026-11-05: a2emu uploaded framebuffer at
+   the end of each Apple loop, which ends 168 VERA steps before the VERA frame:
+   the cut slid through the picture and a scrolling screen tore and hiccuped) */
+static uint8_t frontbuffer[SCREEN_WIDTH * SCREEN_HEIGHT * 4];
 
 /* Pointer to the vc_t struct's framebuffer (set during tick/render) */
 static vc_t *active_vera;
@@ -654,7 +790,7 @@ struct video_layer_properties {
 
 #define NUM_LAYERS 2
 static struct video_layer_properties layer_properties[NUM_LAYERS];
-static struct video_layer_properties prev_layer_properties[2][NUM_LAYERS];
+
 
 static int
 calc_layer_eff_x(const struct video_layer_properties *props, const int x)
@@ -848,20 +984,6 @@ fx_video_space_write(uint32_t address, bool nibble, uint8_t value)
         if (!fx_trans_writes || value > 0)
             video_ram[address & 0x1FFFF] = value;
     }
-    /* Log tilemap writes (char+attr pairs in first 16KB) */
-    if ((address & 0x1FFFF) < 0x4000) {
-        static FILE *tilelog = NULL;
-        static int tcount = 0;
-        if (!tilelog) tilelog = fopen("/tmp/vera_tile.txt", "w");
-        if (tilelog && tcount < 50000) {
-            int row = (address & 0x1FFFF) / 256;
-            int col = ((address & 0x1FFFF) % 256) / 2;
-            int is_attr = (address & 1);
-            fprintf(tilelog, "[%02d,%02d] %s=0x%02X addr=%05X\n", row, col, is_attr ? "ATR" : "CHR", value, address & 0x1FFFF);
-            tcount++;
-            fflush(tilelog);
-        }
-    }
     if (address >= ADDR_PSG_START && address < ADDR_PSG_END) {
         psg_writereg(address & 0x3f, value);
     } else if (address >= ADDR_PALETTE_START && address < ADDR_PALETTE_END) {
@@ -974,7 +1096,7 @@ get_and_inc_address(uint8_t sel, bool write)
         fx_x_pixel_position += fx_x_pixel_increment;
         fx_y_pixel_position += fx_y_pixel_increment;
     }
-    io_addr[0] &= 0x1ffff;
+    io_addr[0] &= 0x1ffff;     /* ADDR0/1 are 17 bits */
     io_addr[1] &= 0x1ffff;
     return address;
 }
@@ -1143,6 +1265,9 @@ video_reset(void)
     /* Fill VRAM with random data (matches real hardware) */
     for (int i = 0; i < 128 * 1024; i++)
         video_ram[i] = rand();
+    line_built_y = -1;
+    comp_y = -1;
+    layer_w[0] = layer_w[1] = SCREEN_WIDTH;
 
     sprite_line_collisions = 0;
 
@@ -1180,66 +1305,66 @@ expand_4bpp_data(uint8_t *dst, const uint8_t *src, int dst_size)
 static void
 render_sprite_line(const uint16_t y)
 {
+    /* sprite_renderer.v, timed per clock but event driven.  The finder takes one
+     * clock per attribute entry; a sprite on this line waits until the renderer is
+     * idle (render_busy = start_render_r || state != IDLE), then takes 1 clock
+     * (SF_START_RENDER).  The renderer takes 1 clock in IDLE, then per 32-bit word 2
+     * clocks of WAIT_FETCH and 1 clock per pixel (RENDER), pixels past x=640 included.
+     * Everything stops 798 clocks after the line render starts.  Not modelled: VRAM
+     * contention with the CPU and the layers (they have priority in vram_if.v); a
+     * fetch is taken as granted at once, so this is the most the hardware can draw. */
+    enum { SPRITE_CLOCKS = 798 };
+    unsigned tf = 0;                    /* finder clock */
+    unsigned rfree = 0;                 /* first clock the renderer is free */
+
     memset(sprite_line_col, 0, SCREEN_WIDTH);
     memset(sprite_line_z, 0, SCREEN_WIDTH);
     memset(sprite_line_mask, 0, SCREEN_WIDTH);
 
-    uint16_t sprite_budget = 800 + 1;
-    for (int i = 0; i < NUM_SPRITES; i++) {
-        sprite_budget--;
-        if (sprite_budget == 0) break;
+    for (int i = 0; i < NUM_SPRITES && tf < SPRITE_CLOCKS; i++, tf++) {
         const struct video_sprite_properties *props = &sprite_properties[i];
 
         if (props->sprite_zdepth == 0) continue;
         if (y < props->sprite_y || y >= props->sprite_y + props->sprite_height) continue;
 
-        const uint16_t eff_sy = props->vflip ? ((props->sprite_height - 1) - (y - props->sprite_y)) : (y - props->sprite_y);
+        unsigned ts = tf > rfree ? tf : rfree;      /* SF_START_RENDER */
+        if (ts >= SPRITE_CLOCKS) break;
+        tf = ts;                                    /* the finder resumes after it */
 
+        const uint16_t eff_sy = props->vflip ? ((props->sprite_height - 1) - (y - props->sprite_y)) : (y - props->sprite_y);
         int16_t       eff_sx      = (props->hflip ? (props->sprite_width - 1) : 0);
         const int16_t eff_sx_incr = props->hflip ? -1 : 1;
-
         const uint8_t *bitmap_data = video_ram + props->sprite_address + (eff_sy << (props->sprite_width_log2 - (1 - props->color_mode)));
+        const unsigned ppw = props->color_mode ? 4 : 8;   /* pixels per 32-bit word */
 
         uint8_t unpacked_sprite_line[64];
         const uint16_t width = (props->sprite_width < 64 ? props->sprite_width : 64);
-        const uint8_t vram_fetch_mask = ((2 - props->color_mode) << 2) - 1;
-        if (props->color_mode == 0) {
+        if (props->color_mode == 0)
             expand_4bpp_data(unpacked_sprite_line, bitmap_data, width);
-        } else {
+        else
             memcpy(unpacked_sprite_line, bitmap_data, width);
-        }
 
+        unsigned t = ts + 2;                        /* START, then IDLE with start_render_r */
         for (uint16_t sx = 0; sx < props->sprite_width; ++sx) {
+            if (sx % ppw == 0) t += 2;              /* WAIT_FETCH */
+            if (t >= SPRITE_CLOCKS) break;          /* render_time_done */
+            t++;                                    /* RENDER: this pixel */
+
             const uint16_t line_x = props->sprite_x + sx;
-            if (line_x >= SCREEN_WIDTH) {
-                eff_sx += eff_sx_incr;
-                continue;
-            }
-
-            if (!(sx & vram_fetch_mask)) {
-                sprite_budget--;
-                if (sprite_budget == 0) break;
-            }
-            sprite_budget--;
-            if (sprite_budget == 0) break;
-
             uint8_t col_index = unpacked_sprite_line[eff_sx];
             eff_sx += eff_sx_incr;
+            if (line_x >= SCREEN_WIDTH || col_index == 0) continue;
 
-            if (col_index > 0) {
-                sprite_line_collisions |= sprite_line_mask[line_x] & props->sprite_collision_mask;
-
-                /* a sprite that loses on Z (equal Z too) isn't written, nor is its mask */
-                if (props->sprite_zdepth > sprite_line_z[line_x]) {
-                    sprite_line_mask[line_x] |= props->sprite_collision_mask;
-                    if (col_index < 16)
-                        col_index += props->palette_offset;
-                    sprite_line_col[line_x] = col_index;
-                    sprite_line_z[line_x] = props->sprite_zdepth;
-                }
+            sprite_line_collisions |= sprite_line_mask[line_x] & props->sprite_collision_mask;
+            if (props->sprite_zdepth > sprite_line_z[line_x]) {     /* render_pixel */
+                if (col_index < 16)
+                    col_index += props->palette_offset;
+                sprite_line_col[line_x] = col_index;
+                sprite_line_z[line_x] = props->sprite_zdepth;
+                sprite_line_mask[line_x] |= props->sprite_collision_mask;   /* only when written */
             }
         }
-        if (sprite_budget == 0) break;  /* out of time mid-sprite: the rest of the line is too */
+        rfree = t;                                  /* back in IDLE */
     }
 }
 
@@ -1250,8 +1375,8 @@ render_sprite_line(const uint16_t y)
 static void
 render_layer_line_text(uint8_t layer, uint16_t y)
 {
-    const struct video_layer_properties *props = &prev_layer_properties[1][layer];
-    const struct video_layer_properties *props0 = &prev_layer_properties[0][layer];
+    const struct video_layer_properties *props = &layer_properties[layer];   /* at the line change */
+    const struct video_layer_properties *props0 = props;
 
     const uint8_t max_pixels_per_byte = (8 >> props->color_depth) - 1;
     const int     eff_y               = calc_layer_eff_y(props0, y);
@@ -1333,10 +1458,10 @@ render_layer_line_text(uint8_t layer, uint16_t y)
  * ================================================================ */
 
 static void
-render_layer_line_tile(uint8_t layer, uint16_t y)
+render_layer_line_tile(uint8_t layer, uint16_t y, int x0, int x1)
 {
-    const struct video_layer_properties *props = &prev_layer_properties[1][layer];
-    const struct video_layer_properties *props0 = &prev_layer_properties[0][layer];
+    const struct video_layer_properties *props = &layer_properties[layer];   /* at the line change */
+    const struct video_layer_properties *props0 = props;
 
     const uint8_t max_pixels_per_byte = (8 >> props->color_depth) - 1;
     const int     eff_y               = calc_layer_eff_y(props0, y);
@@ -1361,7 +1486,7 @@ render_layer_line_tile(uint8_t layer, uint16_t y)
     int8_t   color_shift_incr;
 
     {
-        const int eff_x = calc_layer_eff_x(props, 0);
+        const int eff_x = calc_layer_eff_x(props, x0);
         const uint32_t map_addr = calc_layer_map_addr_base2(props, eff_x, eff_y) - map_addr_begin;
         const uint8_t byte0 = tile_bytes[map_addr];
         const uint8_t byte1 = tile_bytes[map_addr + 1];
@@ -1389,7 +1514,7 @@ render_layer_line_tile(uint8_t layer, uint16_t y)
         s = video_space_read(props->tile_base + tile_offset);
     }
 
-    for (int x = 0; x < SCREEN_WIDTH; x++) {
+    for (int x = x0; x < x1; x++) {
         const int eff_x = calc_layer_eff_x(props, x);
 
         if ((eff_x & max_pixels_per_byte) == 0) {
@@ -1440,15 +1565,14 @@ render_layer_line_tile(uint8_t layer, uint16_t y)
 static void
 render_layer_line_bitmap(uint8_t layer, uint16_t y)
 {
-    const struct video_layer_properties *props = &prev_layer_properties[1][layer];
+    const struct video_layer_properties *props = &layer_properties[layer];   /* at the line change */
+    uint8_t palette_offset = reg_layer[layer][4] & 0xf;
 
     int yy = y % props->tileh;
     uint32_t y_add = (yy * props->tilew * props->bits_per_pixel) >> 3;
 
     for (int x = 0; x < SCREEN_WIDTH; x++) {
         int xx = x % props->tilew;
-
-        uint8_t palette_offset = reg_layer[layer][4] & 0xf;
 
         uint16_t x_add = (xx * props->bits_per_pixel) >> 3;
         uint32_t tile_offset = y_add + x_add;
@@ -1481,8 +1605,22 @@ calculate_line_col_index(uint8_t spr_zindex, uint8_t spr_col_index, uint8_t l1_c
     return col_index;
 }
 
+static void render_line_inner(uint16_t y, float scan_pos_x);
+
 static void
 render_line(uint16_t y, float scan_pos_x)
+{
+    if (vc_mode == VC_RENDER_AUTO && vc_exact) {
+        double t0 = vc_now_ns();
+        render_line_inner(y, scan_pos_x);
+        vc_auto_ns += vc_now_ns() - t0;
+    } else {
+        render_line_inner(y, scan_pos_x);
+    }
+}
+
+static void
+render_line_inner(uint16_t y, float scan_pos_x)
 {
     static uint16_t y_prev;
     static uint16_t s_pos_x_p;
@@ -1494,15 +1632,19 @@ render_line(uint16_t y, float scan_pos_x)
     uint16_t vstart = reg_composer[6] << 1;
     uint16_t vstop = reg_composer[7] << 1;
 
+    /* A new line: as the HDL renders line y into its line buffers during line y-1
+       (layer_renderer.v / sprite_renderer.v, from x=2 of y-1), the layer and sprite
+       buffers are built here, ONCE, from the VRAM and layer registers as they were at
+       the end of line y-1 (video_step_internal makes this first call at the line
+       change, before any write of line y).  Writes during line y reach line y+1; only
+       the composer (palette, border, window, HSCALE, enables) acts on the shown line,
+       per pixel, in the segments below. */
     if (y != y_prev) {
         y_prev = y;
         s_pos_x_p = 0;
 
         memcpy(prev_reg_composer[1], prev_reg_composer[0], sizeof(*reg_composer) * COMPOSER_SLOTS);
         memcpy(prev_reg_composer[0], reg_composer, sizeof(*reg_composer) * COMPOSER_SLOTS);
-
-        memcpy(prev_layer_properties[1], prev_layer_properties[0], sizeof(*layer_properties) * NUM_LAYERS);
-        memcpy(prev_layer_properties[0], layer_properties, sizeof(*layer_properties) * NUM_LAYERS);
 
         if ((dc_video & 3) > 1) { /* 480i or 240p */
             if ((y >> 1) == 0) {
@@ -1511,10 +1653,59 @@ render_line(uint16_t y, float scan_pos_x)
                 eff_y_fp += (prev_reg_composer[1][2] << 10);
             }
         } else {
-            if (y == 0) {
+            /* composer.v: the scaled counter restarts at 0 on the first line >= VSTART
+               of the frame and steps on line y only if line y-1 was inside
+               VSTART..VSTOP (registers as sampled at the start of y-1) */
+            static bool vstarted;
+            uint16_t vs1 = prev_reg_composer[1][6] << 1, ve1 = prev_reg_composer[1][7] << 1;
+            if (y == 0)
+                vstarted = false;
+            if (!vstarted && y >= vs1) {
+                vstarted = true;
                 eff_y_fp = 0;
-            } else if ((y >= vstart) && (y < vstop)) {
+            } else if (vstarted && (eff_y_fp >> 16) < 480 && y - 1 >= vs1 && y - 1 < ve1) {
                 eff_y_fp += (prev_reg_composer[1][2] << 9);
+            }
+        }
+
+        uint16_t ly = ((dc_video & 8) && (dc_video & 3) > 1) ? (y & 0xfffe) : y;
+        uint16_t eff_y = (eff_y_fp >> 16);
+        if (eff_y >= 480) eff_y = 480 - (ly & 1);
+        line_src = eff_y;
+        if (!vc_exact && ly < SCREEN_HEIGHT && eff_y == line_built_y && vc_wver == line_built_wver
+            && (dc_video & 0x70) == line_built_en) {
+            /* the same source line as the line before, nothing written: as built */
+        } else if (ly < SCREEN_HEIGHT) {
+            /* the layer pixels the composer reads: eff_x = n * HSCALE / 128 for
+               the n-th pixel from HSTART */
+            int hs = reg_composer[4] << 2, he = reg_composer[5] << 2, need = 0;
+            if (he > SCREEN_WIDTH) he = SCREEN_WIDTH;
+            if (he > hs)
+                need = (int)((((uint32_t)(he - hs - 1) * reg_composer[1]) << 9) >> 16) + 2;
+            if (need > SCREEN_WIDTH || vc_exact) need = SCREEN_WIDTH;
+            line_built_y = eff_y;
+            line_built_wver = vc_wver;
+            line_built_en = dc_video & 0x70;
+
+            if (dc_video & 0x40) {
+                render_sprite_line(eff_y);
+            } else {
+                memset(sprite_line_col, 0, sizeof sprite_line_col);
+                memset(sprite_line_z, 0, sizeof sprite_line_z);
+                memset(sprite_line_mask, 0, sizeof sprite_line_mask);
+            }
+            for (uint8_t layer = 0; layer < 2; layer++) {
+                layer_w[layer] = SCREEN_WIDTH;
+                if (!(dc_video & (0x10 << layer)))
+                    memset(layer_line[layer], 0, sizeof layer_line[layer]);  /* no fetches */
+                else if (layer_properties[layer].text_mode)
+                    render_layer_line_text(layer, eff_y);
+                else if (layer_properties[layer].bitmap_mode)
+                    render_layer_line_bitmap(layer, eff_y);
+                else {
+                    render_layer_line_tile(layer, eff_y, 0, need);
+                    layer_w[layer] = need;
+                }
             }
         }
     }
@@ -1536,55 +1727,31 @@ render_line(uint16_t y, float scan_pos_x)
         eff_x_fp = 0;
 
     uint8_t out_mode = reg_composer[0] & 3;
+
+    /* VGA, the whole line now, the same source line as the line above composed
+       in one go, nothing written since: the same pixels */
+    const bool whole = s_pos_x_p == 0 && s_pos_x == SCREEN_WIDTH && out_mode == 1;
+    if (!vc_exact && whole && comp_y >= 0 && comp_y == y - 1 && comp_wver == vc_wver && comp_src == line_src
+        && y >= vstart && y < vstop && comp_y >= vstart) {
+        uint32_t *fb = (uint32_t *)framebuffer + y * SCREEN_WIDTH;
+        memcpy(fb, fb - SCREEN_WIDTH, SCREEN_WIDTH * sizeof *fb);
+        comp_y = y;
+        s_pos_x_p = s_pos_x;
+        return;
+    }
+    if (whole) {
+        comp_y = y;
+        comp_wver = vc_wver;
+        comp_src = line_src;
+    } else if (s_pos_x > s_pos_x_p) {           /* a part of a line: not reusable */
+        comp_y = -1;
+    }
     uint8_t border_color = reg_composer[3];
     uint16_t hstart = reg_composer[4] << 2;
     uint16_t hstop = reg_composer[5] << 2;
 
-    uint16_t eff_y = (eff_y_fp >> 16);
-    if (eff_y >= 480) eff_y = 480 - (y & 1);
-
-    layer_line_enable[0] = dc_video & 0x10;
-    layer_line_enable[1] = dc_video & 0x20;
-    sprite_line_enable   = dc_video & 0x40;
-
-    for (uint8_t layer = 0; layer < 2; layer++) {
-        if (!layer_line_enable[layer] && old_layer_line_enable[layer]) {
-            for (uint16_t i = s_pos_x_p; i < SCREEN_WIDTH; i++)
-                layer_line[layer][i] = 0;
-        }
-        if (s_pos_x_p == 0)
-            old_layer_line_enable[layer] = layer_line_enable[layer];
-    }
-
-    if (!sprite_line_enable && old_sprite_line_enable) {
-        for (uint16_t i = s_pos_x_p; i < SCREEN_WIDTH; i++) {
-            sprite_line_col[i] = 0;
-            sprite_line_z[i] = 0;
-            sprite_line_mask[i] = 0;
-        }
-    }
-    if (s_pos_x_p == 0)
-        old_sprite_line_enable = sprite_line_enable;
-
-    if (sprite_line_enable)
-        render_sprite_line(eff_y);
-
-    if (layer_line_enable[0]) {
-        if (prev_layer_properties[1][0].text_mode)
-            render_layer_line_text(0, eff_y);
-        else if (prev_layer_properties[1][0].bitmap_mode)
-            render_layer_line_bitmap(0, eff_y);
-        else
-            render_layer_line_tile(0, eff_y);
-    }
-    if (layer_line_enable[1]) {
-        if (prev_layer_properties[1][1].text_mode)
-            render_layer_line_text(1, eff_y);
-        else if (prev_layer_properties[1][1].bitmap_mode)
-            render_layer_line_bitmap(1, eff_y);
-        else
-            render_layer_line_tile(1, eff_y);
-    }
+    /* the composer masks the layers and sprites with the live enables (composer.v) */
+    const bool en_l0 = dc_video & 0x10, en_l1 = dc_video & 0x20, en_spr = dc_video & 0x40;
 
     if (out_mode != 0) {
         if (y < vstart || y >= vstop) {
@@ -1600,9 +1767,16 @@ render_line(uint16_t y, float scan_pos_x)
                 col_line[x] = border_color;
 
             const uint32_t scale = reg_composer[1];
+            int last_x = -1;                    /* HSCALE < 128: a source pixel shows */
+            uint8_t last_col = 0;               /* on several pixels, mixed once */
             for (uint16_t x = MAX(hstart, s_pos_x_p); x < hstop && x < s_pos_x; ++x) {
                 uint16_t eff_x = eff_x_fp >> 16;
-                col_line[x] = (eff_x < SCREEN_WIDTH) ? calculate_line_col_index(sprite_line_z[eff_x], sprite_line_col[eff_x], layer_line[0][eff_x], layer_line[1][eff_x]) : 0;
+                if (eff_x != last_x) {
+                    last_x = eff_x;
+                    last_col = (eff_x < SCREEN_WIDTH) ? calculate_line_col_index(en_spr ? sprite_line_z[eff_x] : 0, sprite_line_col[eff_x],
+                                                                                en_l0 ? layer_line[0][eff_x] : 0, en_l1 ? layer_line[1][eff_x] : 0) : 0;
+                }
+                col_line[x] = last_col;
                 eff_x_fp += (scale << 9);
             }
             for (uint16_t x = hstop; x < s_pos_x; ++x)
@@ -1647,6 +1821,8 @@ vsync_isr(void)
     isr = (isr & 0xf) | sprite_line_collisions;
     sprite_line_collisions = 0;
     isr |= 1; vc_vsync_raised++; /* VSYNC IRQ */
+    if (vc_mode == VC_RENDER_AUTO) vc_auto_frame();
+    if (!vc_norender) memcpy(frontbuffer, framebuffer, sizeof frontbuffer);
 }
 
 static void
@@ -1658,7 +1834,9 @@ update_isr_and_coll(uint16_t y, uint16_t compare)
         isr |= 2; /* LINE IRQ */
 }
 
-/* composite LINE irq compares the counter before it steps, bit 0 ignored */
+/* composite (composer.v): the line counter steps by 2 at the next-line strobe of
+   each line and restarts at each field (field 2 on the odd lines); the LINE irq
+   compares it before it steps, bit 0 ignored */
 static void
 ntsc_next_line(bool ntsc_mode)
 {
@@ -1681,6 +1859,21 @@ ntsc_next_line(bool ntsc_mode)
 /* Approximate 68020 cycles per VGA scanline at 16 MHz:
  * 16,000,000 / (60 * 525) ~ 508 */
 #define CPU_MHZ 16.0f
+
+/* the field line the NTSC half-line counter is drawing, if it draws one (even
+   half-lines of each field; the second field draws the odd lines) */
+static bool
+ntsc_field_line(uint16_t *y)
+{
+    if (ntsc_scan_pos_y < SCAN_HEIGHT) {
+        *y = ntsc_scan_pos_y - NTSC_Y_OFFSET_LOW;
+        return (*y & 1) == 0;
+    }
+    *y = ntsc_scan_pos_y - NTSC_Y_OFFSET_HIGH;
+    if (*y & 1) return false;
+    *y |= 1;
+    return true;
+}
 
 static bool
 video_step_internal(float steps)
@@ -1707,8 +1900,11 @@ video_step_internal(float steps)
                 frame_count++;
             }
         }
-        if (!ntsc_mode)
+        if (!ntsc_mode) {
             update_isr_and_coll(vga_scan_pos_y - VGA_Y_OFFSET, irq_line);
+            if (!vc_norender)
+                render_line(vga_scan_pos_y - VGA_Y_OFFSET, 0);   /* build the new line's buffers now */
+        }
     }
 
     float ntsc_from = ntsc_half_cnt;
@@ -1734,7 +1930,7 @@ video_step_internal(float steps)
             }
         }
         ntsc_scan_pos_y++;
-        if (ntsc_scan_pos_y == field_len) {
+        if (ntsc_scan_pos_y == field_len) {            /* VSYNC at the end of each field */
             if (ntsc_mode) {
                 vsync_isr();
                 new_frame = true;
@@ -1748,6 +1944,11 @@ video_step_internal(float steps)
                 new_frame = true;
                 frame_count++;
             }
+        }
+        if (ntsc_mode) {
+            uint16_t ny;
+            if (ntsc_field_line(&ny))
+                render_line(ny, 0);                              /* build the new line's buffers now */
         }
     }
 
@@ -1770,13 +1971,15 @@ static uint8_t
 video_read_reg(uint8_t reg)
 {
     bool ntsc_mode = reg_composer[0] & 2;
+    /* composer.v: SCANLINE is y_counter_r, the line being RENDERED (shown + 1), 9 bits
+       (so it reads 0 while line 511 is shown), pegged at 511 while the shown line
+       (y_counter_rr) is 512-524.  Composite: the counter steps by 2 per line, from 0 or 1 per field. */
     uint16_t scanline;
-    if (ntsc_mode)
+    if (ntsc_mode) {
         scanline = ntsc_y_counter_prev >= 512 ? 511 : ntsc_y_counter & 0x1ff;
-    else if (vga_scan_pos_y >= 512)
-        scanline = 511;
-    else
-        scanline = (vga_scan_pos_y + 1) & 0x1ff;  /* the counter has moved on as line L starts */
+    } else {
+        scanline = vga_scan_pos_y >= 512 ? 511 : (vga_scan_pos_y + 1) & 0x1FF;
+    }
 
     switch (reg & 0x1F) {
         case 0x00: return io_addr[io_addrsel] & 0xff;
@@ -1817,7 +2020,7 @@ video_read_reg(uint8_t reg)
         }
         case 0x05: return (io_dcsel << 1) | io_addrsel;
         case 0x06: return ((irq_line & 0x100) >> 1) | ((scanline & 0x100) >> 2) | (ien & 0xF);
-        case 0x07: { audio_render(); uint8_t rv = isr | (pcm_is_fifo_almost_empty() ? 8 : 0);
+        case 0x07: { uint8_t rv = isr | (pcm_is_fifo_almost_empty() ? 8 : 0);
                      vc_isr_reads++; if (rv & 1) vc_isr_set++;
                      return rv; }
         case 0x08: return scanline & 0xFF;
@@ -1862,7 +2065,7 @@ video_read_reg(uint8_t reg)
         case 0x17: case 0x19:
             return reg_layer[1][reg - 0x14];
 
-        case 0x1B: audio_render(); return pcm_read_ctrl();
+        case 0x1B: return pcm_read_ctrl();
         case 0x1C: return pcm_read_rate();
         case 0x1D: return 0;
 
@@ -1876,9 +2079,45 @@ video_read_reg(uint8_t reg)
  * Register write
  * ================================================================ */
 
+/* Mid-line raster effects: draw the current line up to the beam (the caller has
+ * brought the VERA up to this CPU cycle), so a register or VRAM write lands at
+ * the pixel it happens on, not at the next line.  As x16emu's video_step(...,
+ * true); for DATA writes (VRAM, palette, sprites) x16emu needs -midline-effects,
+ * here it is on unless A2_VERA_MIDLINE=0. */
+static int vc_midline_data = -1;
+
+static void
+video_midline(void)
+{
+    if (reg_composer[0] & 2) {                      /* NTSC: half-line counter */
+        uint16_t y;
+        if (ntsc_field_line(&y))
+            render_line(y, ntsc_half_cnt);
+    } else if (!vc_norender) {
+        render_line(vga_scan_pos_y - VGA_Y_OFFSET, vga_scan_pos_x);
+    }
+}
+
+/* before a register write: the tile layers of the line in the buffers to their
+   full width, from the VRAM and registers they were built from (unchanged
+   until this write), and the buffers no longer reusable */
+static void
+line_buffers_complete(void)
+{
+    for (uint8_t layer = 0; layer < 2; layer++)
+        if (layer_w[layer] < SCREEN_WIDTH) {
+            render_layer_line_tile(layer, line_built_y, layer_w[layer], SCREEN_WIDTH);
+            layer_w[layer] = SCREEN_WIDTH;
+        }
+    vc_wver++;
+}
+
 static void
 video_write_reg(uint8_t reg, uint8_t value)
 {
+    /* ADDR (0-2) and the IRQ registers (6-8) change nothing a line shows */
+    if ((reg & 0x1F) > 2 && ((reg & 0x1F) < 6 || (reg & 0x1F) > 8))
+        line_buffers_complete();
     switch (reg & 0x1F) {
         case 0x00:
             if (fx_2bit_poly && fx_4bit_mode && fx_addr1_mode == 2 && io_addrsel == 1) {
@@ -1915,22 +2154,6 @@ video_write_reg(uint8_t reg, uint8_t value)
                  counted too. */
               { extern unsigned long vc_wr_nz[16];
                 if (value) vc_wr_nz[wa >> 13]++; } }
-            /* Log DATA0/DATA1 writes to tilemap area */
-            {
-                int sel = reg - 3;
-                uint32_t a = io_addr[sel] & 0x1FFFF;
-                if (a < 0x4000) {
-                    static FILE *dlog = NULL;
-                    static int dc = 0;
-                    if (!dlog) dlog = fopen("/tmp/vera_data.txt", "w");
-                    if (dlog && dc < 100000) {
-                        fprintf(dlog, "DATA%d addr=%05X val=%02X '%c' inc=%d\n",
-                            sel, a, value, (value >= 0x20 && value < 0x7F) ? value : '.', increments[io_inc[sel]]);
-                        dc++;
-                        fflush(dlog);
-                    }
-                }
-            }
             /* poke mode only takes a DATA1 write in polygon mode; DATA0 writes are normal */
             if (fx_2bit_poking && fx_addr1_mode == 2 && reg == 4) {
                 fx_2bit_poking = false;
@@ -1944,6 +2167,12 @@ video_write_reg(uint8_t reg, uint8_t value)
                 break;
             }
 
+            if (vc_midline_data < 0) {
+                const char *e = getenv("A2_VERA_MIDLINE");
+                vc_midline_data = e ? atoi(e) : 1;
+            }
+            if (vc_midline_data)
+                video_midline();                    /* potential mid-line raster effect */
             bool nibble = fx_nibble_bit[reg - 3];
             uint32_t address = get_and_inc_address(reg - 3, true);
 
@@ -2029,13 +2258,16 @@ video_write_reg(uint8_t reg, uint8_t value)
             vc_ien_writes++; vc_ien_last = ien; if(!(ien & 1)) vc_ien_disarms++;
             break;
         case 0x07:
-            isr &= value ^ 0xff; vc_isr_acks++;
+            /* top.v: a write clears only SPRCOL/LINE/VSYNC (bits 2:0); bits 7:4 are the
+               last frame's collision mask until the next VSYNC, bit 3 is the FIFO level */
+            isr &= ~(value & 0x07); vc_isr_acks++;
             break;
         case 0x08:
             irq_line = (irq_line & 0x100) | value;
             break;
 
         case 0x09: case 0x0A: case 0x0B: case 0x0C: {
+            video_midline();                        /* potential mid-line raster effect */
             int i = reg - 0x09 + (io_dcsel << 2);
             /* DC_VIDEO is sampled once at end of run, which cannot distinguish
                "never enabled layer 0" from "enabled it, then crashed with it
@@ -2148,19 +2380,21 @@ video_write_reg(uint8_t reg, uint8_t value)
 
         case 0x0D: case 0x0E: case 0x0F:
         case 0x10: case 0x11: case 0x12: case 0x13:
+            video_midline();                        /* potential mid-line raster effect */
             reg_layer[0][reg - 0x0D] = value;
             refresh_layer_properties(0);
             break;
 
         case 0x14: case 0x15: case 0x16:
         case 0x17: case 0x18: case 0x19: case 0x1A:
+            video_midline();
             reg_layer[1][reg - 0x14] = value;
             refresh_layer_properties(1);
             break;
 
-        case 0x1B: audio_render(); pcm_write_ctrl(value); break;
-        case 0x1C: audio_render(); pcm_write_rate(value); break;
-        case 0x1D: audio_render(); pcm_write_fifo(value); break;
+        case 0x1B: pcm_write_ctrl(value); break;
+        case 0x1C: pcm_write_rate(value); break;
+        case 0x1D: pcm_write_fifo(value); break;
 
         case 0x1E:
         case 0x1F:
@@ -2178,15 +2412,12 @@ void vc_init(vc_t *v)
     memset(v, 0, sizeof(*v));
     active_vera = v;
     video_reset();
-    audio_reset();
 
     /* Set output mode to VGA with layer 0 enabled */
     reg_composer[0] = 0x21; /* VGA output + L0 enable */
 
     refresh_palette();
-
-    const char *sd = getenv("A2_SDCARD");
-    if (sd) sdcard_attach(sd);
+    /* init banner removed */
 }
 
 uint8_t vc_read(vc_t *v, int reg)
@@ -2259,15 +2490,28 @@ int vc_tick(vc_t *v, int cycles)
         vc_speed_carry = scaled - whole;
         vcyc = whole;
     }
+    {   /* the SPI and the audio run on whole 25 MHz VERA clocks */
+        double clocks = vcyc * PIXEL_FREQ / CPU_MHZ + vera_clk_carry;
+        unsigned whole = (unsigned)clocks;
+        vera_clk_carry = clocks - whole;
+        vera_spi_step(whole);
+        audio_clock(whole);
+    }
     bool new_frame = video_step_internal(vcyc);
 
     if (new_frame) {
         v->frame_count = frame_count;
     }
 
-    audio_render();
     v->irq_out = video_get_irq_out();
     return v->irq_out;
+}
+
+/* the last whole frame (0xAARRGGBB, A unused), 640 x 480, as at its VSYNC: a
+   frontend uploads it as it is, without vc_render_frame's copy */
+const uint32_t *vc_frame_pixels(void)
+{
+    return (const uint32_t *)frontbuffer;
 }
 
 void vc_render_frame(vc_t *v)
@@ -2307,7 +2551,7 @@ uint8_t *vc_vram(void) { return video_ram; }
    NES->VERA setup can load a palette without driving the DATA port byte-by-byte.
    Caller must mark it dirty via vc_palette_dirty(). */
 uint8_t *vc_palette(void) { return palette; }
-void vc_palette_dirty(void) { video_palette.dirty = true; }
+void vc_palette_dirty(void) { video_palette.dirty = true; comp_y = -1; }
 
 /* write a PSG register (reg = voice*4 + field) straight into the synth
    state, bypassing the DATA-port path. */
@@ -2319,6 +2563,7 @@ void vc_set_sprite(int idx, const uint8_t *b8)
 {
     int i;
     if (idx < 0 || idx >= 128) return;
+    line_buffers_complete();
     for (i = 0; i < 8; i++) sprite_data[idx][i] = b8[i];
     refresh_sprite_properties((uint16_t)idx);
 }
