@@ -35,7 +35,10 @@ Reinette II plus (Apple ][+ / IIe, 65C02) with an A2VERA card: VERA video, PSG a
   E.g. `./a2emu --model iiee --aux RAM2E GWRAM.po`.
 - VERA slot: `A2_VERA_SLOT=<1-7>` (default 4; `a2run --vera-slot N`), e.g. `A2_VERA_SLOT=5 ./a2emu disk.po`
   puts the card at $C500-$C51F.  Slot 6 always holds the Disk II and slot 7 the hard disk when one is
-  inserted: their firmware wins the reads there, so the VERA is unreachable there.
+  inserted: their firmware wins the reads there, so the emulator warns that the VERA is unreachable.
+  Programs find the slot at run time with `examples/vera/vera.c`: a slot whose firmware looks like a
+  disk controller is skipped, and a hit needs the VERA's registers to read back what was written (the
+  floating bus never does).
 - `make install` copies binaries, `assets/` and `rom/` to `~/.local/share/a2emu-vera` and puts `a2emu`/`a2run`/`a2fs` in `~/bin` (override with `DATADIR=`/`BINDIR=`); `make uninstall` removes them but keeps the installed `rom/`.
 - Keys: Ctrl+F1 / Alt+F1 save the floppy in drive 1 / 2 back to its file, F2 screenshot, F3 paste the clipboard as keystrokes,
   Shift/Ctrl+F4 volume, Shift/Ctrl+F5/F6 joystick release/action speed, Shift/Ctrl+F7 zoom,
@@ -57,6 +60,12 @@ Reinette II plus (Apple ][+ / IIe, 65C02) with an A2VERA card: VERA video, PSG a
     `cl65 -t apple2 -C $(SDK)/a2emu-vera.cfg -I $(SDK) -Osir -Cl -o prog.bin main.c $(SDK)/a2fs.c $(SDK)/rwts.s`
     and `a2fs mkimage prog.dsk prog.bin DATA=data.bin`.
 - `examples/sdtest` (`make test`): SD init, CSD, single/multiple block reads and writes over SPI, checked from the host.
+- `examples/vera`: cc65 helpers for the card (`vera.h` registers, `vera_detect()`, `vera_wait_vsync()`,
+  `vera_w0()`/`vera_w1()`/`VERA_POKE()` for the registers with read side effects -- a store through a
+  pointer is `STA (zp),Y`, which on the NMOS 6502 of the ][+ and unenhanced IIe reads the register
+  first -- and the `vtext` text console) used by `examples/test_font`, `test_scrolling`, `test_maze`, `test_matrix`, `test_fx`, `test_irq` (ports of the VERA_C64 tests;
+  `vera_irq.s` hooks the 6502 IRQ vector in LC RAM, `delay.s` waits in CPU cycles),
+  `vera_demo` (320x240 8 bpp bitmap) and `memtest` (IIe aux RAM + VERA registers + VRAM).
 - `examples/ramworks` (`make test`): IIe aux banking for every `--aux` size, and the RAM2E II's
   commands over three power-ons (detection, LED, capacity mask, command timeout, saved settings).
 - `examples/dblres` (`make run`): 16 colour bars in double hi-res, then double lo-res, then plain

@@ -150,6 +150,7 @@ void vera_bus_init(void)
         g_vera.framebuffer = calloc((size_t)VC_SCREEN_W * VC_SCREEN_H, sizeof(uint32_t));
     }
     g_vera_enabled = 1;
+    vera_slot_check();
 }
 
 // memory layout
@@ -515,6 +516,16 @@ static unsigned hd_blocks = 0;
 static uint8_t  hd_cmd = 0, hd_unit = 0, hd_status = 0;
 static uint16_t hd_block = 0, hd_buf = 0;
 
+/* Two cards in one slot: slot 6 always holds the Disk II, slot 7 the hard disk when one is
+ * inserted; their firmware wins the reads of $Cnxx, so the VERA there is unreachable. */
+void vera_slot_check(void) {
+	if (!g_vera_enabled) return;
+	if (g_vera_base == SL6START)
+		fprintf(stderr, "a2emu: warning: slot 6 holds the Disk II, the VERA card there is unreachable\n");
+	if (g_hd_present && g_vera_base == SL7START)
+		fprintf(stderr, "a2emu: warning: the hard disk takes slot 7, the VERA card there is unreachable\n");
+}
+
 int insertHardDisk(char *filename) {
 	hd_ro = 0;
 	hd_file = fopen(filename, "r+b");                                             // try read/write
@@ -539,6 +550,7 @@ int insertHardDisk(char *filename) {
 	sl7[0xFC] = hd_blocks & 0xFF; sl7[0xFD] = hd_blocks >> 8;                    // block count
 	g_hd_present = 1;
 	memcpy(fetchMem + SL7START, sl7, sizeof sl7);
+	vera_slot_check();
 	return 1;
 }
 
